@@ -218,13 +218,13 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=4.4';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=4.4';
-import { createImu } from './js/imu.js?v=4.4';
-import { createViewer3D } from './js/viewer3d.js?v=4.4';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=4.4';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.4';
-const BUILD = '4.4';
+import { createTracker } from './js/tracking.js?v=4.5';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=4.5';
+import { createImu } from './js/imu.js?v=4.5';
+import { createViewer3D } from './js/viewer3d.js?v=4.5';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=4.5';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.5';
+const BUILD = '4.5';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -243,7 +243,7 @@ const P = {
   // датчики телефона: наклон метки берём из гироскопа (метка лежит на столе)
   // поворот сцены — из гироскопа, камера медленно подправляет (kmw); imulag — задержка кадра камеры, мс
   USE_IMU: q.get('imu') !== '0' && q.get('mount') !== 'wall', TOL: num('tol', 20),
-  IMULAG: num('imulag', 0), KMW: num('kmw', 0.03),
+  IMULAG: num('imulag', 0), KMW: num('kmw', 0.03), COAST: num('coast', 1000),
   // угол обзора камеры телефона по длинной стороне кадра, градусы (0 = как в MindAR по умолчанию, 45°)
   FOV: num('fov', 66),
   RAW: q.get('raw') === '1', JUMP: num('jump', 25), NOGUARD: q.get('noguard') === '1',
@@ -669,7 +669,7 @@ async function start(mode) {
     if (!imu.fresh()) return 'датчики: нет данных';
     const div = st.imuN ? (st.imuAngSum / st.imuN).toFixed(1) + '°' : '—';
     const share = st.updates ? Math.round(100 * st.fused / st.updates) + '%' : '—';
-    return `датчики: ${share}  расхожд. ${div}  fov ${P.FOV || 45}°\nперезахватов: ${st.redetect}  метка: ${tracker.markerState}`;
+    return `датчики: ${share}  расхожд. ${div}  fov ${P.FOV || 45}°\nперезахватов: ${st.redetect}  удерж.: ${st.coast}  метка: ${tracker.markerState}`;
   };
   if (window.DEV) setInterval(() => {
     paramsBox.textContent = `сборка ${BUILD}\n` +
@@ -692,6 +692,9 @@ async function start(mode) {
         const land = isLandscape();
         rotateEl.style.display = land ? 'flex' : 'none';
         tracker.setPaused(land);
+        // при повороте заморозка снимается — кнопку приводим в соответствие
+        freezeBtn.classList.toggle('on', tracker.frozen);
+        freezeBtn.textContent = tracker.frozen ? 'Продолжить' : 'Заморозить';
         if (land) console.log('[экран] горизонтально — пауза');
         else console.log('[экран] вертикально — продолжаем');
       }, 250);

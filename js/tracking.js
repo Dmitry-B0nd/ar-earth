@@ -6,7 +6,7 @@ import { MindARThree } from 'mindar-image-three';
 
 export function createTracker(opts) {
   const { container, markerUrl, CF, BETA, MISS, WARM, SYNC, RAW, JUMP, NOGUARD, onFound, onLost, onStall, onFatal,
-          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03,
+          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 1000,
           PMC = 2, PB = 5, DMC = 0.6, DB = 2, RMC, RB, DC = 1, FOV = 66 } = opts;
 
   const mindar = new MindARThree({
@@ -113,11 +113,22 @@ export function createTracker(opts) {
     const orig = loader.loadInput.bind(loader);
     loader.loadInput = (input) => {
       if (imu && imu.fresh() && imu.hasAlpha) { imu.worldFromCamera(qWCframe, IMULAG); haveFrameQ = true; } else haveFrameQ = false;
+      frameUpdated = false;
       return orig(input);
     };
     loader.__imuHooked = true;
   }
-  const stats = { rejected: 0, updates: 0, fused: 0, imuAngSum: 0, imuN: 0, redetect: 0 };
+  const stats = { rejected: 0, updates: 0, fused: 0, imuAngSum: 0, imuN: 0, redetect: 0, coast: 0 };
+
+  // ---- Положение метки «в комнате» и удержание сцены по гироскопу ----
+  // Когда поворот берётся из гироскопа, положение метки тоже храним в координатах комнаты
+  // (с началом в телефоне): при повороте телефона оно не меняется, поэтому сглаживание
+  // не отстаёт. А если на резком движении камера на мгновение потеряла метку (смаз),
+  // сцену держит на месте гироскоп — до COAST_MS, пока метка по расчёту остаётся в кадре.
+  const COAST_MS = COAST;
+  const wPos = new THREE.Vector3(), qWCuse = new THREE.Quaternion(), qCW = new THREE.Quaternion();
+  const outPos = new THREE.Vector3(), outQ = new THREE.Quaternion(), proj = new THREE.Vector3();
+  let worldMode = false, lastGood = -1e9, frameUpdated = false, posSuspect = 0;
 
   let frozen = false, frozenWant = false;
   anchor.onTargetUpdate = () => {
@@ -177,10 +188,27 @@ export function createTracker(opts) {
         if ((ang > JUMP || jump > 0.5) && suspect < 3) { suspect++; stats.rejected++; return; }
       }
     }
+    const now = performance.now();
+    if (fused) {
+      // положение метки в комнате; резкий скачок относительно сглаженного — скорее всего, смаз:
+      // несколько кадров не верим камере (сцену держит гироскоп), потом принимаем
+      wPos.copy(cPos).applyQuaternion(qWC);
+      if (worldMode && ready && now - lastGood < 300) {
+        const d = wPos.distanceTo(sPos) / sDist;
+        if (d > 0.25 && posSuspect < 4) { posSuspect++; stats.rejected++; return; }
+      }
+      posSuspect = 0;
+      if (!worldMode || now - lastGood > 300) { worldMode = true; ready = false; }
+      qWCuse.copy(qWC);
+      aPos.copy(wPos); aQ.copy(qMW);
+    } else {
+      if (worldMode) { worldMode = false; ready = false; }
+      aPos.copy(cPos); aQ.copy(cQ);
+    }
     suspect = 0;
     fusedNow = fused;
-    aPos.copy(cPos); aQ.copy(cQ); aS = s; accepted = true;
-    if (SYNC) smoothPose(performance.now());
+    aS = s; accepted = true; lastGood = now; frameUpdated = true;
+    if (SYNC) smoothPose(now);
   };
 
   // ---- 2. Сглаживание (One Euro) по отдельности для трёх величин ----
@@ -195,7 +223,7 @@ export function createTracker(opts) {
   const angle = (u, v) => Math.acos(Math.max(-1, Math.min(1, u.dot(v))));
   function smoothPose(now) {
     if (frozen) return;
-    if (!(anchor.group.visible && accepted)) { ready = false; last = now; return; }
+    if (!(anchor.group.visible && accepted)) { if (!canCoast(now)) ready = false; last = now; return; }
     const dist = aPos.length();
     tDir.copy(aPos).divideScalar(dist);
     if (!ready || RAW) {
@@ -214,7 +242,22 @@ export function createTracker(opts) {
     }
     last = now;
     sPos.copy(sDir).multiplyScalar(sDist);
-    content.matrix.compose(sPos, sQ, sScale.set(sS, sS, sS));
+    composeContent();
+  }
+  // в «мировом» режиме переводим сглаженную позу из комнаты в камеру по ориентации телефона qWCuse
+  function composeContent() {
+    if (worldMode) {
+      qCW.copy(qWCuse).invert();
+      outPos.copy(sPos).applyQuaternion(qCW);
+      outQ.copy(qCW).multiply(sQ);
+      content.matrix.compose(outPos, outQ, sScale.set(sS, sS, sS));
+    } else content.matrix.compose(sPos, sQ, sScale.set(sS, sS, sS));
+  }
+  // можно ли сейчас держать сцену по одному гироскопу (метка недавно была и по расчёту в кадре)
+  function canCoast(now) {
+    if (!(worldMode && ready && imu && imu.fresh()) || now - lastGood > COAST_MS) return false;
+    proj.copy(sPos).applyQuaternion(qCW.copy(qWCuse).invert()).project(camera);
+    return proj.z < 1 && Math.abs(proj.x) < 1.1 && Math.abs(proj.y) < 1.1;
   }
 
   // ---- 3. Синхронизация видео с трекером ----
@@ -262,7 +305,16 @@ export function createTracker(opts) {
   function countProcessed() {
     hookFrameImu();
     const ctrl = mindar.controller, orig = ctrl.onUpdate;
-    ctrl.onUpdate = (data) => { if (data.type === 'processDone') { lastProcessed = realProcessed = performance.now(); loopRuns++; } orig(data); };
+    ctrl.onUpdate = (data) => {
+      if (data.type === 'processDone') {
+        lastProcessed = realProcessed = performance.now(); loopRuns++;
+        // кадр обработан, а позы нет (смаз, перезахват) — поворачиваем сцену по гироскопу этого кадра
+        if (SYNC && !frozen && !frameUpdated && haveFrameQ && canCoast(realProcessed)) {
+          qWCuse.copy(qWCframe); composeContent(); stats.coast++;
+        }
+      }
+      orig(data);
+    };
   }
   function restartProcessing() {
     if (restarting) return;
@@ -365,6 +417,7 @@ export function createTracker(opts) {
   return {
     mindar, renderer, scene, camera, content, stats, intrinsics,
     get agree() { return agree; },
+    get debug() { return { worldMode, ready, sinceGood: Math.round(performance.now() - lastGood), frameUpdated, haveFrameQ, imuFresh: !!(imu && imu.fresh()), coast: canCoast(performance.now()), proj: proj.toArray().map((v) => +v.toFixed(2)) }; },
     async start() {
       mindar.ui.showLoading();
       let t = performance.now();
@@ -381,7 +434,10 @@ export function createTracker(opts) {
     },
     // вызывать каждый кадр перед отрисовкой
     frame(now) {
+      const live = !SYNC || now - realProcessed > 150;          // на экране живое видео, а не обработанный кадр
+      if (live && worldMode && !frozen && imu && imu.fresh()) imu.worldFromCamera(qWCuse, 0);
       if (!SYNC) smoothPose(now);
+      else if (live && !frozen && canCoast(now)) composeContent();
       // Если распознавание не выдаёт кадров (пауза, запуск после поворота, перезапуск),
       // показываем живое видео, чтобы картинка с камеры не замирала. При заморозке — не трогаем.
       if (SYNC && syncBg && syncCtx && !frozen && now - realProcessed > 150) {
@@ -391,7 +447,7 @@ export function createTracker(opts) {
           syncCtx.drawImage(v, 0, 0, syncBg.width, syncBg.height);
         }
       }
-      const want = frozen ? frozenWant : (anchor.group.visible && accepted);
+      const want = frozen ? frozenWant : ((anchor.group.visible && accepted) || canCoast(now));
       // Плавность: при потере метки сцена ещё ~0,25 с стоит на месте (короткие пропуски
       // незаметны), потом за 0,3 с растворяется; при нахождении — быстро проявляется.
       if (want) {
@@ -409,6 +465,9 @@ export function createTracker(opts) {
     // поэтому после возврата в вертикальное положение всё продолжается сразу, без перезапуска.
     setPaused(on) {
       if (on === paused) return;
+      // заморозку при повороте снимаем: после поворота меняется кадр камеры, и «замороженный»
+      // снимок всё равно не совпал бы с экраном (раньше камера после этого не оживала)
+      if (on && frozen) { paused = true; this.setFrozen(false); console.log('[экран] поворот — заморозка снята'); }
       paused = on;
       clearTimeout(resumeTimer);
       if (on) {
