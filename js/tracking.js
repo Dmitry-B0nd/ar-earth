@@ -91,6 +91,21 @@ export function createTracker(opts) {
   const redetects = [];
   const K = KMW;                          // скорость подстройки qMW по камере (0,03 ≈ 1 с при 30 кадрах/с)
   const SNAP = 6, SOFT = 5, HARD = 15, BIG = 40;
+  // разложение поправки qInst·qMW⁻¹ на поворот вокруг оси метки (twist) и наклон оси (swing)
+  const qDelta = new THREE.Quaternion(), qTwist = new THREE.Quaternion(), qSwing = new THREE.Quaternion(), qT2 = new THREE.Quaternion();
+  const nAx = new THREE.Vector3();
+  let twistAng = 0, swingAng = 0;
+  function splitTwist() {
+    qDelta.copy(qInst).multiply(qTmp.copy(qMW).invert());
+    if (qDelta.w < 0) qDelta.set(-qDelta.x, -qDelta.y, -qDelta.z, -qDelta.w);
+    nAx.copy(Z).applyQuaternion(qMW);                                    // ось метки в мире
+    const p = qDelta.x * nAx.x + qDelta.y * nAx.y + qDelta.z * nAx.z;
+    qTwist.set(nAx.x * p, nAx.y * p, nAx.z * p, qDelta.w);
+    if (qTwist.lengthSq() < 1e-12) qTwist.identity(); else qTwist.normalize();
+    qSwing.copy(qDelta).multiply(qTmp.copy(qTwist).invert());             // qDelta = qSwing · qTwist
+    twistAng = 2 * Math.acos(Math.min(1, Math.abs(qTwist.w))) * 180 / Math.PI;
+    swingAng = 2 * Math.acos(Math.min(1, Math.abs(qSwing.w))) * 180 / Math.PI;
+  }
   const qAngle = (a, b) => 2 * Math.acos(Math.min(1, Math.abs(a.dot(b)))) * 180 / Math.PI;
   // Метка почти горизонтальна → считаем строго горизонтальной (стол). Убирает остаточный наклон.
   function snapHorizontal() {
@@ -259,13 +274,22 @@ export function createTracker(opts) {
       recentN++;
       if (!haveMW) { qMW.copy(qInst); snapHorizontal(); haveMW = true;
         console.log('[трекинг] ориентация метки:', snapped ? 'горизонтально' : 'наклон ' + markerTilt.toFixed(0) + '°'); }
-      const dev = qAngle(qInst, qMW);                                     // насколько камера не согласна с гироскопом
+      // Поправка qMW → qInst раскладывается на две части:
+      //  • поворот вокруг оси метки (метку крутят на столе) — камера видит его точно, догоняем быстро;
+      //  • наклон оси метки — камера видит его с дрожью, подстраиваем медленно (K).
+      // Расхождение для перезахватов считаем только по наклону: поворот листка — не ошибка трекера.
+      splitTwist();
+      const dev = swingAng;                                               // насколько камера не согласна с гироскопом
       stats.imuAngSum += dev; stats.imuN++;
       const now = performance.now();
       devAvg = devAvg === null ? dev : devAvg + 0.08 * (dev - devAvg);
 
       // согласны — подправляем ориентацию метки по камере (медленно)
-      if (dev < HARD) { qMW.slerp(qInst, K); snapHorizontal(); }
+      if (dev < HARD) {
+        const kT = Math.min(1, 0.05 + twistAng / 5);                      // 0,5° (шум) → медленно, ≥ 5° → сразу
+        qMW.premultiply(qT2.identity().slerp(qTwist, kT)).premultiply(qTmp.identity().slerp(qSwing, K));   // qDelta = qSwing·qTwist: сначала поворот вокруг оси
+        snapHorizontal();
+      }
       // > 40° больше секунды — метку явно переложили: берём новую ориентацию
       if (dev > BIG) {
         if (bigSince === null) bigSince = now;
