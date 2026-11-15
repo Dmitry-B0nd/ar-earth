@@ -185,7 +185,7 @@ export function createTracker(opts) {
   }
 
   // ---- 3. Синхронизация видео с трекером ----
-  let syncBg = null, syncTimer = null;
+  let syncBg = null, syncTimer = null, syncCtx = null;
   function teardownSync() {
     clearInterval(syncTimer); syncTimer = null;
     if (syncBg) { syncBg.remove(); syncBg = null; }
@@ -197,7 +197,7 @@ export function createTracker(opts) {
     const bg = syncBg = document.createElement('canvas');
     bg.width = src.width; bg.height = src.height;
     bg.style.position = 'absolute'; bg.style.zIndex = '-1';
-    const bgCtx = bg.getContext('2d');
+    const bgCtx = syncCtx = bg.getContext('2d');
     v.parentNode.insertBefore(bg, v.nextSibling);
     v.style.opacity = '0';
     const syncStyle = () => {
@@ -348,6 +348,15 @@ export function createTracker(opts) {
     // вызывать каждый кадр перед отрисовкой
     frame(now) {
       if (!SYNC) smoothPose(now);
+      // Если распознавание не выдаёт кадров (пауза, запуск после поворота, перезапуск),
+      // показываем живое видео, чтобы картинка с камеры не замирала. При заморозке — не трогаем.
+      if (SYNC && syncBg && syncCtx && !frozen && now - realProcessed > 150) {
+        const v = mindar.video;
+        if (v && v.readyState >= 2 && v.videoWidth) {
+          if (syncBg.width !== v.videoWidth || syncBg.height !== v.videoHeight) { syncBg.width = v.videoWidth; syncBg.height = v.videoHeight; }
+          syncCtx.drawImage(v, 0, 0, syncBg.width, syncBg.height);
+        }
+      }
       const want = frozen ? frozenWant : (anchor.group.visible && accepted);
       // Плавность: при потере метки сцена ещё ~0,25 с стоит на месте (короткие пропуски
       // незаметны), потом за 0,3 с растворяется; при нахождении — быстро проявляется.
@@ -397,7 +406,7 @@ export function createTracker(opts) {
             onFatal && onFatal('после поворота распознавание не восстановилось');
           }, 3500);
         }, 2500);
-      }, 400);
+      }, 250);
     },
     get flat() { return flat; },
     // направление «вверх» (против силы тяжести) в координатах сцены метки; false — датчиков нет
