@@ -218,13 +218,13 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=4.12';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=4.12';
-import { createImu } from './js/imu.js?v=4.12';
-import { createViewer3D } from './js/viewer3d.js?v=4.12';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=4.12';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.12';
-const BUILD = '4.12';
+import { createTracker } from './js/tracking.js?v=4.13';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=4.13';
+import { createImu } from './js/imu.js?v=4.13';
+import { createViewer3D } from './js/viewer3d.js?v=4.13';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=4.13';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.13';
+const BUILD = '4.13';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -687,7 +687,8 @@ async function start(mode) {
   const camLine = () => {
     const v = tracker.mindar.video, trk = v && v.srcObject && v.srcObject.getVideoTracks()[0];
     const fr = trk && trk.getSettings ? trk.getSettings().frameRate : null;
-    return `камера ${v ? v.videoWidth + '×' + v.videoHeight : '—'}  ${fr ? Math.round(fr) + ' к/с' : ''}  новых ${tracker.stats.newFrames}\n`;
+    return `камера ${v ? v.videoWidth + '×' + v.videoHeight : '—'}  ${fr ? Math.round(fr) + ' к/с' : ''}  новых ${tracker.stats.newFrames}\n` +
+      `режим: ${lite.on ? 'лёгкий (' + lite.why + ')' : 'обычный'}  рисование ${lite.fps}\n`;
   };
   if (window.DEV) setInterval(() => {
     paramsBox.textContent = `сборка ${BUILD}\n` +
@@ -723,6 +724,35 @@ async function start(mode) {
 
   // Ось Земли всегда «вверх» по гироскопу — даже если метку показали на мониторе или держат в руке
   const gUp = new THREE.Vector3(), zAxis = new THREE.Vector3(0, 0, 1), qEarth = new THREE.Quaternion();
+
+  // ---- Лёгкий режим для слабых телефонов ----
+  // Распознавание метки и рисование сцены делят одну видеокарту. Если телефон не тянет
+  // (сцена рисуется < 40 кадров/с или трекер при видимой метке < 22 раз/с три секунды подряд),
+  // облегчаем картинку: рендер 1:1, не чаще 30 кадров/с, без облаков, спутники реже, камера 30 к/с.
+  // ?potato=1 — включить сразу, ?potato=0 — никогда не включать.
+  const POTATO = q.get('potato');
+  const lite = { on: false, why: '', bad: 0, fps: 0, loops: 0, since: performance.now() };
+  let lastRender = 0, renders = 0;
+  function setLite(on, why) {
+    if (lite.on === on) return;
+    lite.on = on; lite.why = why;
+    if (AR) tracker.setLite(on);
+    earth.setLite(on);
+    if (sats) sats.setLite(on);
+    console.log('[качество]', on ? 'лёгкий режим —' : 'обычный режим —', why);
+  }
+  if (POTATO === '1') setLite(true, 'вручную');
+  setInterval(() => {
+    const fps = renders; renders = 0;
+    const loops = AR ? tracker.loops - lite.loops : 0; if (AR) lite.loops = tracker.loops;
+    lite.fps = fps; lite.loopRate = loops;
+    if (lite.on || POTATO === '0' || document.hidden || performance.now() - lite.since < 3000) return;
+    if (AR && (tracker.frozen || tracker.restarting)) { lite.bad = 0; return; }
+    const slowTrack = AR && tracker.shown && loops < 22;
+    if (fps < 40 || slowTrack) lite.bad++; else lite.bad = 0;
+    if (lite.bad >= 3) setLite(true, `авто: рисование ${fps} к/с, трекер ${AR ? loops : '—'} Гц`);
+  }, 1000);
+
   renderer.setAnimationLoop(() => {
     const now = performance.now();
     simT += Math.min(now - lastFrame, 250) * view.speed; lastFrame = now;
@@ -732,10 +762,15 @@ async function start(mode) {
       qEarth.setFromUnitVectors(zAxis, gUp);
       earthRoot.quaternion.slerp(qEarth, 0.15);
     }
-    earth.update(simDate);
-    poi.update(now / 1000, camera);
-    if (sats) sats.update(simDate, renderer, earth.sunWorld, camera);
-    renderer.render(scene, camera);
+    // в лёгком режиме рисуем не чаще ~30 раз в секунду (время видеокарты нужнее трекеру)
+    const skipRender = lite.on && now - lastRender < 30;
+    if (!skipRender) {
+      earth.update(simDate);
+      poi.update(now / 1000, camera);
+      if (sats) sats.update(simDate, renderer, earth.sunWorld, camera);
+      renderer.render(scene, camera);
+      lastRender = now; renders++;
+    }
     if (stats) stats.update();
     // подсказка появляется, если метки не видно дольше 1,5 с
     if (AR) {

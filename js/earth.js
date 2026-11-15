@@ -127,6 +127,8 @@ export function createEarth({ radius = 0.3, textures, renderer }) {
     sunWorld: sunUniform.value,   // направление на Солнце в мировых координатах
     ecef,          // сюда кладём всё, что «приклеено» к поверхности (точки интереса)
     radius,
+    // лёгкий режим для слабых телефонов: без облаков (это целый лишний проход по сфере)
+    setLite(on) { clouds.visible = !on; },
     // date — симулируемое время (Date)
     update(date) {
       ecef.rotation.z = gmst(date);

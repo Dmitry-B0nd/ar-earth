@@ -202,6 +202,7 @@ export function createSatellites({ earth, data, scene, artistic = true }) {
   let modelReady = false;
   const camPosW = new THREE.Vector3();
 
+  let propEvery = 100;
   const api = {
     group, items, count: N, filter,
 
@@ -212,12 +213,14 @@ export function createSatellites({ earth, data, scene, artistic = true }) {
       lastProp = 0; lastOrbitCycle = -1e9;
     },
     isShown,
+    // лёгкий режим: полный пересчёт обычных точек 2 раза в секунду вместо 10 (между пересчётами — по скорости)
+    setLite(on) { propEvery = on ? 500 : 100; },
 
     update(date, renderer, sunDirWorld, camera) {
       const now = performance.now(), t = date.getTime();
       // обычные точки: полный пересчёт 10 раз в секунду, между пересчётами — по скорости;
       // контекстные и выбранный — точно в каждом кадре (их мало, а на них смотрят пристально)
-      const full = now - lastProp > 100;
+      const full = now - lastProp > propEvery;
       if (full) lastProp = now;
       for (const it of items) {
         const i = it.i;
