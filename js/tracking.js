@@ -70,8 +70,10 @@ export function createTracker(opts) {
   // flat — метка лежит горизонтально и наклон берём из гироскопа
   let flat = true, bigSince = null, calmSince = null;
   const redetects = [], BIG = 55;
+  let angAvg = null, softSince = null, lastSoft = 0, tiltOk = null;
+  const softHist = [], SOFT = 8;
   function setFlat(on, why) {
-    flat = on; bigSince = badSince = calmSince = null; redetects.length = 0;
+    flat = on; bigSince = badSince = calmSince = softSince = angAvg = tiltOk = null; redetects.length = 0; softHist.length = 0;
     console.log('[трекинг]', on ? 'наклон снова из датчиков:' : 'только камера:', why);
   }
   const stats = { rejected: 0, updates: 0, fused: 0, imuAngSum: 0, imuN: 0, redetect: 0 };
@@ -119,6 +121,31 @@ export function createTracker(opts) {
             if (redetects.length >= 3) setFlat(false, 'перезахваты не помогают — метку, видимо, держат под углом');
           }
         } else badSince = null;
+
+        // «Мягкий» перезахват: трекер может застрять и на небольшой ошибке наклона (5–20°) —
+        // наклон всё равно берётся из гироскопа, но положение метки при таком решении шумное,
+        // и вблизи Земля дрожит. Смотрим на сглаженное расхождение: > SOFT° полторы секунды → перезахват.
+        // Если после двух перезахватов расхождение возвращается к тому же значению — метка правда
+        // так наклонена (неровный стол, изогнутая бумага): запоминаем этот угол и больше не дёргаемся.
+        angAvg = angAvg === null ? ang : angAvg + 0.08 * (ang - angAvg);
+        const accepted_tilt = tiltOk !== null && Math.abs(angAvg - tiltOk) < 3;
+        if (angAvg > SOFT && angAvg <= TOL && !accepted_tilt && now - lastSoft > 3000) {
+          if (softSince === null) softSince = now;
+          else if (now - softSince > 1500) {
+            const ts0 = mindar.controller && mindar.controller.trackingStates[0];
+            if (ts0) ts0.isTracking = false;
+            softSince = null; lastSoft = now; stats.redetect++;
+            while (softHist.length && now - softHist[0].t > 12000) softHist.shift();   // учитываем только недавние
+            softHist.push({ t: now, a: angAvg });
+            console.log('[трекинг] расхождение', angAvg.toFixed(1) + '° держится — мягкий перезахват');
+            if (softHist.length >= 2 && Math.abs(softHist[softHist.length - 1].a - softHist[softHist.length - 2].a) < 2.5) {
+              tiltOk = angAvg;
+              console.log('[трекинг] расхождение не уходит после перезахватов — считаю, что метка наклонена на', angAvg.toFixed(1) + '°');
+            }
+            angAvg = null;
+          }
+        } else softSince = null;
+        if (tiltOk !== null && angAvg !== null && Math.abs(angAvg - tiltOk) > 5) { tiltOk = null; softHist.length = 0; }
       } else {
         if (ang < 10) {
           if (calmSince === null) calmSince = now;
