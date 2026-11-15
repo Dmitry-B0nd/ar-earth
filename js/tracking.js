@@ -6,7 +6,7 @@ import { MindARThree } from 'mindar-image-three';
 
 export function createTracker(opts) {
   const { container, markerUrl, CF, BETA, MISS, WARM, SYNC, RAW, JUMP, NOGUARD, onFound, onLost, onStall, onFatal,
-          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500,
+          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1,
           PMC = 2, PB = 5, DMC = 0.6, DB = 2, RMC, RB, DC = 1, FOV = 66 } = opts;
 
   const mindar = new MindARThree({
@@ -114,11 +114,76 @@ export function createTracker(opts) {
     loader.loadInput = (input) => {
       if (imu && imu.fresh() && imu.hasAlpha) { imu.worldFromCamera(qWCframe, IMULAG); haveFrameQ = true; } else haveFrameQ = false;
       frameUpdated = false; frameT = performance.now();
+      if (PREDICT) predictPose();
       return orig(input);
     };
     loader.__imuHooked = true;
   }
-  const stats = { rejected: 0, updates: 0, fused: 0, imuAngSum: 0, imuN: 0, redetect: 0, coast: 0 };
+  const stats = { rejected: 0, updates: 0, fused: 0, imuAngSum: 0, imuN: 0, redetect: 0, coast: 0, pred: 0 };
+
+  // ---- Подсказка трекеру: где метка окажется на следующем кадре ----
+  // MindAR ищет каждую точку метки только в ±10 пикселях от того места, где она была на прошлом
+  // кадре, и никак не предугадывает движение. Если телефон сдвинули быстрее — трекер не находит
+  // точки, «цепляется» за старое место (сцена едет вместе с телефоном) и теряет метку.
+  // Поэтому перед каждым кадром подставляем трекеру предсказанную позу:
+  //   поворот телефона между кадрами — из гироскопа, сдвиг — с той скоростью, что была на прошлых кадрах.
+  // Трекер затем уточняет позу по картинке как обычно — предсказание лишь ставит его поиск в нужное место.
+  // Позы MindAR — в его осях камеры (x вправо, y вниз, z вперёд); наши (three.js) — x вправо, y вверх, z назад.
+  const pr = { M: null, T: 0, q: new THREE.Quaternion(), hasQ: false, v: [0, 0, 0], vT: -1e9 };
+  // скорость годится, если посчитана на прошлом кадре; при PREDICT=2 — и после короткой (<0,4 с) потери метки
+  const vFresh = () => (PREDICT >= 2 ? frameT - pr.vT < 400 : pr.vT === pr.T);
+  const qD = new THREE.Quaternion(), mD = new THREE.Matrix4(), Rcv = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  const F = [1, -1, -1];
+  // поворот камеры между кадрами в осях MindAR (по гироскопу); нет данных — без поворота
+  function deltaRot(hasQ0, q0, hasQ1, q1) {
+    if (!(hasQ0 && hasQ1)) { for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) Rcv[i][j] = i === j ? 1 : 0; return; }
+    qD.copy(q1).invert().multiply(q0);                       // точки камеры прошлого кадра → этого
+    const e = mD.makeRotationFromQuaternion(qD).elements;    // по столбцам
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) Rcv[i][j] = F[i] * F[j] * e[j * 4 + i];
+  }
+  function videoRotated() {
+    const v = mindar.video, c = mindar.controller;
+    return v && c && v.videoWidth === c.inputHeight && v.videoHeight === c.inputWidth && c.inputWidth !== c.inputHeight;
+  }
+  // после обработки кадра: запоминаем позу и оцениваем скорость сдвига
+  function predictLearn() {
+    const ts = mindar.controller && mindar.controller.trackingStates[0];
+    if (!ts || !ts.isTracking || !ts.currentModelViewTransform || videoRotated()) { pr.M = null; return; }
+    const M = ts.currentModelViewTransform, dt = frameT - pr.T;
+    if (pr.M && dt > 5 && dt < 250) {
+      deltaRot(pr.hasQ, pr.q, haveFrameQ, qWCframe);
+      for (let i = 0; i < 3; i++) {
+        const rotT = Rcv[i][0] * pr.M[0][3] + Rcv[i][1] * pr.M[1][3] + Rcv[i][2] * pr.M[2][3];
+        const vi = (M[i][3] - rotT) / dt;                      // сдвиг, не объяснённый поворотом, за 1 мс
+        pr.v[i] = vFresh() ? pr.v[i] + 0.5 * (vi - pr.v[i]) : vi;
+      }
+      pr.vT = frameT;
+    }
+    pr.M = M.map((r) => r.slice()); pr.T = frameT;
+    pr.hasQ = haveFrameQ; if (haveFrameQ) pr.q.copy(qWCframe);
+  }
+  // перед обработкой кадра: подставляем трекеру предсказанную позу
+  function predictPose() {
+    const ts = mindar.controller && mindar.controller.trackingStates[0];
+    if (!ts || !ts.isTracking || !pr.M || videoRotated()) return;
+    const dt = frameT - pr.T;
+    if (!(dt > 5 && dt < 250)) return;
+    deltaRot(pr.hasQ, pr.q, haveFrameQ, qWCframe);
+    const M = pr.M, out = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]];
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 4; j++)
+      out[i][j] = Rcv[i][0] * M[0][j] + Rcv[i][1] * M[1][j] + Rcv[i][2] * M[2][j];
+    if (vFresh()) {
+      // сдвиг по экрану продолжаем почти полностью, по глубине (хуже измеряется) — осторожно;
+      // и не больше трети расстояния до метки за кадр
+      const dist = Math.hypot(out[0][3], out[1][3], out[2][3]);
+      let sx = pr.v[0] * dt * 0.85, sy = pr.v[1] * dt * 0.85, sz = pr.v[2] * dt * 0.3;
+      const len = Math.hypot(sx, sy, sz), cap = dist / 3;
+      if (len > cap) { const k = cap / len; sx *= k; sy *= k; sz *= k; }
+      out[0][3] += sx; out[1][3] += sy; out[2][3] += sz;
+    }
+    ts.currentModelViewTransform = out;
+    stats.pred++;
+  }
 
   // ---- Удержание сцены, когда камера на мгновение потеряла метку (смаз при резком движении) ----
   // Сцена в это время не стоит на месте экрана, а движется так, как двигалась бы метка:
@@ -317,6 +382,7 @@ export function createTracker(opts) {
       if (data.type === 'processDone') {
         lastProcessed = realProcessed = performance.now(); loopRuns++;
         // кадр обработан, а позы нет (смаз, перезахват) — поворачиваем сцену по гироскопу этого кадра
+        if (PREDICT) predictLearn();
         if (SYNC && !frozen && !frameUpdated && haveFrameQ) coast(qWCframe, frameT);
       }
       orig(data);
