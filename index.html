@@ -218,13 +218,13 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=4.11';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=4.11';
-import { createImu } from './js/imu.js?v=4.11';
-import { createViewer3D } from './js/viewer3d.js?v=4.11';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=4.11';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.11';
-const BUILD = '4.11';
+import { createTracker } from './js/tracking.js?v=4.12';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=4.12';
+import { createImu } from './js/imu.js?v=4.12';
+import { createViewer3D } from './js/viewer3d.js?v=4.12';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=4.12';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.12';
+const BUILD = '4.12';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -672,12 +672,16 @@ async function start(mode) {
     const st = tracker.stats;
     if (!P.USE_IMU) return 'датчики: выкл';
     if (!imuOk) return 'датчики: нет доступа';
-    if (!imu.fresh()) return 'датчики: нет данных';
+    const d = imu.diag;
+    // что реально присылает телефон: ориентация (обычная / компасная, с данными / пустая), движение, «вверх»
+    const raw = `ориент. ${d.rel}/${d.relNull} компас ${d.abs}/${d.absNull} движ. ${d.mot} g ${d.grav}`;
+    if (!imu.fresh() && !(imu.gravFresh && imu.gravFresh())) return 'датчики: нет данных\n' + raw;
     const div = st.imuN ? (st.imuAngSum / st.imuN).toFixed(1) + '°' : '—';
     const share = st.updates ? Math.round(100 * st.fused / st.updates) + '%' : '—';
     const pk = imu.takePeaks();
     const mot = imu.hasMotion ? `пик ${imu.hasAcc ? pk.a.toFixed(1) + ' м/с²' : 'а —'} ${Math.round(pk.w)}°/с` : 'акселерометр: нет данных';
-    return `датчики ${share}  расх. ${div}\nметка: ${tracker.markerState}\nперезахв. ${st.redetect}  удерж. ${st.coast}  предск. ${st.pred}\nрывков ${st.jerks}  ${mot}`;
+    const src = imu.fresh() ? imu.source : 'акселерометр';
+    return `датчики (${src}) ${share}  расх. ${div}\n${raw}\nметка: ${tracker.markerState}\nперезахв. ${st.redetect}  удерж. ${st.coast}  предск. ${st.pred}\nрывков ${st.jerks}  ${mot}`;
   };
   // камера: размер кадра, частота, которую обещает камера, и сколько новых кадров реально пришло за секунду
   const camLine = () => {

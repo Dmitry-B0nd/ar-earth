@@ -139,6 +139,9 @@ export function createTracker(opts) {
   // (а где его нет — по video.currentTime); на повторном кадре время то же, и подсказка трекеру
   // и оценка скорости его не учитывают, а гироскоп берётся на момент появления кадра.
   let vfcT = 0, vfcN = 0, vfcVideo = null, lastFrameId = -1, newFrames = 0;
+  // запасной режим без гироскопа: наклон метки на столе — по направлению «вверх» от акселерометра
+  const upFrame = new THREE.Vector3(), qFixG = new THREE.Quaternion();
+  let haveFrameUp = false, gSign = 1, gFlipVotes = 0, gAngAvg = null, gravMode = false;
   function hookVideoFrames() {
     const v = mindar.video;
     if (!v || vfcVideo === v || typeof v.requestVideoFrameCallback !== 'function') return;
@@ -159,6 +162,9 @@ export function createTracker(opts) {
       // на повторном кадре гироскоп не перечитываем — картинка та же
       if (isNew) {
         if (imu && imu.fresh() && imu.hasAlpha) { imu.worldFromCamera(qWCframe, IMULAG + Math.max(0, now - frameT)); haveFrameQ = true; } else haveFrameQ = false;
+        // нет ориентации (телефон без гироскопа) — хотя бы «вверх» по акселерометру
+        haveFrameUp = !haveFrameQ && !!(imu && imu.gravFresh && imu.gravFresh());
+        if (haveFrameUp) imu.gravityUp(upFrame, gSign);
       }
       frameUpdated = false;
       if (PREDICT) predictPose();
@@ -310,6 +316,21 @@ export function createTracker(opts) {
       // поворот сцены — из гироскопа и усреднённой ориентации метки; положение остаётся от камеры
       if (dev <= BIG) {
         cQ.copy(qWC).invert().multiply(qMW);
+        fused = true; stats.fused++;
+      }
+    }
+    else if (USE_IMU && imu && haveFrameUp) {
+      // Телефон без гироскопа. Метка лежит на столе → её ось должна смотреть вверх, а «вверх»
+      // знает акселерометр. Наклон берём из него, поворот вокруг оси и положение — из камеры.
+      gravMode = true;
+      const ang = nrm.angleTo(upFrame) * 180 / Math.PI;
+      // браузер с обратным знаком ускорения: метка «смотрит» строго вниз много кадров подряд → меняем знак
+      if (ang > 150) { if (++gFlipVotes > 15) { gSign = -gSign; gFlipVotes = 0; gAngAvg = null; console.log('[датчики] знак акселерометра обратный — исправлено'); } }
+      else gFlipVotes = 0;
+      gAngAvg = gAngAvg === null ? ang : gAngAvg + 0.05 * (ang - gAngAvg);
+      stats.imuAngSum += ang; stats.imuN++;
+      if (gAngAvg < 25 && ang < 35) {                    // метка горизонтальна (стол), выброс камеры не больше 35°
+        cQ.premultiply(qFixG.setFromUnitVectors(nrm, upFrame));
         fused = true; stats.fused++;
       }
     }
@@ -650,16 +671,19 @@ export function createTracker(opts) {
       }, 250);
     },
     get markerState() {
-      if (!haveMW) return '—';
+      if (!haveMW) return gravMode ? (gAngAvg !== null && gAngAvg < 25 ? 'горизонтально (акселерометр)' : 'не на столе — только камера') : '—';
       if (bigSince !== null) return 'перенастройка';
       return snapped ? 'горизонтально' : 'наклон ' + markerTilt.toFixed(0) + '°';
     },
     // направление «вверх» (против силы тяжести) в координатах сцены метки; false — датчиков нет
     gravityInContent(out) {
-      if (!(USE_IMU && imu && imu.fresh())) return false;
-      // ориентация метки в комнате уже усреднена — «вверх» в сцене постоянен и не дрожит
-      if (haveMW && fusedNow) return out.copy(WORLD_UP).applyQuaternion(qInv.copy(qMW).invert()).normalize();
-      imu.upCamera(out);
+      if (!(USE_IMU && imu)) return false;
+      if (imu.fresh()) {
+        // ориентация метки в комнате уже усреднена — «вверх» в сцене постоянен и не дрожит
+        if (haveMW && fusedNow) return out.copy(WORLD_UP).applyQuaternion(qInv.copy(qMW).invert()).normalize();
+        imu.upCamera(out);
+      } else if (imu.gravFresh && imu.gravFresh()) imu.gravityUp(out, gSign);
+      else return false;
       return out.applyQuaternion(qInv.copy(sQ).invert()).normalize();
     },
     get frozen() { return frozen; },
