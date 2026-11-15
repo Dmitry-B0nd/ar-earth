@@ -218,13 +218,13 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=4.2';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=4.2';
-import { createImu } from './js/imu.js?v=4.2';
-import { createViewer3D } from './js/viewer3d.js?v=4.2';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=4.2';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.2';
-const BUILD = '4.2';
+import { createTracker } from './js/tracking.js?v=4.3';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=4.3';
+import { createImu } from './js/imu.js?v=4.3';
+import { createViewer3D } from './js/viewer3d.js?v=4.3';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=4.3';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.3';
+const BUILD = '4.3';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -667,7 +667,7 @@ async function start(mode) {
     if (!imu.fresh()) return 'датчики: нет данных';
     const div = st.imuN ? (st.imuAngSum / st.imuN).toFixed(1) + '°' : '—';
     const share = st.updates ? Math.round(100 * st.fused / st.updates) + '%' : '—';
-    return `датчики: ${share}  расхожд. ${div}  fov ${P.FOV || 45}°\nперезахватов: ${st.redetect}  метка: ${tracker.flat ? 'на столе' : 'не горизонтально'}`;
+    return `датчики: ${share}  расхожд. ${div}  fov ${P.FOV || 45}°\nперезахватов: ${st.redetect}  метка: ${tracker.markerState}`;
   };
   if (window.DEV) setInterval(() => {
     paramsBox.textContent = `сборка ${BUILD}\n` +

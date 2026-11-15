@@ -67,14 +67,38 @@ export function createTracker(opts) {
   const nrm = new THREE.Vector3(), toCam = new THREE.Vector3(), up = new THREE.Vector3();
   const xAx = new THREE.Vector3(), yAx = new THREE.Vector3(), basis = new THREE.Matrix4();
   let aS = 1, accepted = false, suspect = 0, agree = 1, fusedNow = false, badSince = null;
-  // flat — метка лежит горизонтально и наклон берём из гироскопа
-  let flat = true, bigSince = null, calmSince = null;
-  const redetects = [], BIG = 55;
-  let angAvg = null, softSince = null, lastSoft = 0, tiltOk = null;
-  const softHist = [], SOFT = 8;
-  function setFlat(on, why) {
-    flat = on; bigSince = badSince = calmSince = softSince = angAvg = tiltOk = null; redetects.length = 0; softHist.length = 0;
-    console.log('[трекинг]', on ? 'наклон снова из датчиков:' : 'только камера:', why);
+  // ---- Наклон метки относительно «вверх» ----
+  // U — направление «вверх» (против силы тяжести) в координатах самой метки. Для метки на столе
+  // это её ось Z, для метки на мониторе — наклонённое направление. Метка неподвижна, поэтому U
+  // постоянен: оцениваем его по камере и гироскопу, а дальше наклон берём из гироскопа с этой поправкой.
+  const Z = new THREE.Vector3(0, 0, 1);
+  const U = new THREE.Vector3(0, 0, 1), Uuse = new THREE.Vector3(0, 0, 1);
+  const uInst = new THREE.Vector3(), uRecent = new THREE.Vector3(), tmpV = new THREE.Vector3();
+  const qInvC = new THREE.Quaternion(), qFix = new THREE.Quaternion();
+  let bigSince = null, hardSince = null, softSince = null, lastRedetect = 0, devAvg = null, uRecentN = 0, markerTilt = 0;
+  const redetects = [];
+  const BIG = 55, HARD = 20, SOFT = 8, SNAP = 6;
+  function updateUse() {
+    markerTilt = U.angleTo(Z) * 180 / Math.PI;
+    Uuse.copy(markerTilt < SNAP ? Z : U);           // почти горизонтальная — считаем строго горизонтальной
+  }
+  function reanchor(why) {
+    U.copy(uRecentN ? uRecent : uInst).normalize();
+    updateUse();
+    redetects.length = 0; bigSince = hardSince = softSince = devAvg = null;
+    console.log('[трекинг] наклон метки:', markerTilt < SNAP ? 'горизонтально' : markerTilt.toFixed(0) + '°', '—', why);
+  }
+  function redetect(now, dev, kind) {
+    const ts0 = mindar.controller && mindar.controller.trackingStates[0];
+    if (ts0) ts0.isTracking = false;                // MindAR на следующем кадре распознает метку с нуля
+    lastRedetect = now; stats.redetect++; devAvg = null;
+    while (redetects.length && now - redetects[0].t > 12000) redetects.shift();
+    redetects.push({ t: now, dev });
+    console.log(`[трекинг] ${kind} перезахват: камера расходится с гироскопом на ${dev.toFixed(1)}°`);
+    // Перезахваты дают одно и то же — значит, это не ошибка трекера, а настоящий наклон метки
+    const n = redetects.length;
+    if (n >= 2 && Math.abs(redetects[n - 1].dev - redetects[n - 2].dev) < 3) reanchor('перезахваты дают один и тот же наклон');
+    else if (redetects.filter((r) => now - r.t < 8000).length >= 3) reanchor('частые перезахваты — метку переложили');
   }
   const stats = { rejected: 0, updates: 0, fused: 0, imuAngSum: 0, imuN: 0, redetect: 0 };
 
@@ -92,75 +116,40 @@ export function createTracker(opts) {
     let fused = false, ang = null;
     if (USE_IMU && imu && imu.fresh()) {
       imu.upCamera(up);
-      ang = Math.acos(Math.max(-1, Math.min(1, nrm.dot(up)))) * 180 / Math.PI;
+      uInst.copy(up).applyQuaternion(qInvC.copy(cQ).invert());          // «вверх» в координатах метки по этой позе
+      if (!uRecentN) uRecent.copy(uInst); else uRecent.lerp(uInst, 0.1);
+      uRecentN++;
+      ang = uInst.angleTo(Uuse) * 180 / Math.PI;                          // расхождение камеры и гироскопа
       stats.imuAngSum += ang; stats.imuN++;
-      // Метка на столе: наклон берём из датчиков (камера с наклоном ошибается, гироскоп — нет).
-      // Но метку могут показать на мониторе, повесить на стену или держать в руке — тогда
-      // гироскоп о её наклоне ничего не знает, и работаем только по камере. Различаем так:
-      //  • расхождение > 55° держится 1,2 с — метка явно не горизонтальна → только камера;
-      //  • расхождение 20–55° держится 0,7 с — скорее всего трекер «зацепился» за ложный наклон →
-      //    заставляем его найти метку заново; если перезахваты идут один за другим (3 за 8 с),
-      //    значит, метку держат под углом → только камера;
-      //  • в режиме «только камера» расхождение < 10° держится 2 с — метку положили на стол → снова датчики.
       const now = performance.now();
-      agree += 0.1 * ((ang < TOL ? 1 : 0) - agree);
-      if (flat) {
-        if (ang > BIG) {
-          if (bigSince === null) bigSince = now;
-          else if (now - bigSince > 1200) setFlat(false, 'метка не горизонтальна (' + ang.toFixed(0) + '°)');
-        } else bigSince = null;
-        if (ang > TOL && ang <= BIG) {
-          if (badSince === null) badSince = now;
-          else if (now - badSince > 700) {
-            const ts0 = mindar.controller && mindar.controller.trackingStates[0];
-            if (ts0) ts0.isTracking = false;            // MindAR на следующем кадре распознает метку с нуля
-            badSince = null; stats.redetect++;
-            redetects.push(now);
-            while (redetects.length && now - redetects[0] > 8000) redetects.shift();
-            console.log('[трекинг] наклон по камере расходится с гироскопом на', ang.toFixed(0) + '° — перезахват метки');
-            if (redetects.length >= 3) setFlat(false, 'перезахваты не помогают — метку, видимо, держат под углом');
-          }
-        } else badSince = null;
+      devAvg = devAvg === null ? ang : devAvg + 0.08 * (ang - devAvg);
 
-        // «Мягкий» перезахват: трекер может застрять и на небольшой ошибке наклона (5–20°) —
-        // наклон всё равно берётся из гироскопа, но положение метки при таком решении шумное,
-        // и вблизи Земля дрожит. Смотрим на сглаженное расхождение: > SOFT° полторы секунды → перезахват.
-        // Если после двух перезахватов расхождение возвращается к тому же значению — метка правда
-        // так наклонена (неровный стол, изогнутая бумага): запоминаем этот угол и больше не дёргаемся.
-        angAvg = angAvg === null ? ang : angAvg + 0.08 * (ang - angAvg);
-        const accepted_tilt = tiltOk !== null && Math.abs(angAvg - tiltOk) < 3;
-        if (angAvg > SOFT && angAvg <= TOL && !accepted_tilt && now - lastSoft > 3000) {
-          if (softSince === null) softSince = now;
-          else if (now - softSince > 1500) {
-            const ts0 = mindar.controller && mindar.controller.trackingStates[0];
-            if (ts0) ts0.isTracking = false;
-            softSince = null; lastSoft = now; stats.redetect++;
-            while (softHist.length && now - softHist[0].t > 12000) softHist.shift();   // учитываем только недавние
-            softHist.push({ t: now, a: angAvg });
-            console.log('[трекинг] расхождение', angAvg.toFixed(1) + '° держится — мягкий перезахват');
-            if (softHist.length >= 2 && Math.abs(softHist[softHist.length - 1].a - softHist[softHist.length - 2].a) < 2.5) {
-              tiltOk = angAvg;
-              console.log('[трекинг] расхождение не уходит после перезахватов — считаю, что метка наклонена на', angAvg.toFixed(1) + '°');
-            }
-            angAvg = null;
-          }
-        } else softSince = null;
-        if (tiltOk !== null && angAvg !== null && Math.abs(angAvg - tiltOk) > 5) { tiltOk = null; softHist.length = 0; }
-      } else {
-        if (ang < 10) {
-          if (calmSince === null) calmSince = now;
-          else if (now - calmSince > 2000) setFlat(true, 'метка снова лежит горизонтально');
-        } else calmSince = null;
+      // согласны — потихоньку уточняем наклон метки (медленно, чтобы шум трекера его не раскачал)
+      if (ang < SOFT) { U.lerp(uInst, 0.004).normalize(); updateUse(); }
+
+      // сильно расходятся (> 55°) больше 1,2 с — метку явно положили иначе: определяем наклон заново
+      if (ang > BIG) {
+        if (bigSince === null) bigSince = now;
+        else if (now - bigSince > 1200) reanchor('метка расположена иначе, чем раньше');
+      } else bigSince = null;
+      // 20–55° держится 0,7 с — скорее всего, трекер ошибся с наклоном: заставляем найти метку заново
+      if (ang > HARD && ang <= BIG) {
+        if (hardSince === null) hardSince = now;
+        else if (now - hardSince > 700 && now - lastRedetect > 700) { hardSince = null; redetect(now, ang, 'резкий'); }
+      } else hardSince = null;
+      // 8–20° держится 1,5 с — трекер «застрял» на небольшой ошибке: мягкий перезахват
+      if (devAvg !== null && devAvg > SOFT && devAvg <= HARD && now - lastRedetect > 3000) {
+        if (softSince === null) softSince = now;
+        else if (now - softSince > 1500) { softSince = null; redetect(now, devAvg, 'мягкий'); }
+      } else softSince = null;
+
+      // Наклон берём из гироскопа: поворачиваем позу так, чтобы «вверх» метки совпал с гироскопом.
+      // Поворот вокруг вертикали и положение остаются от камеры.
+      if (ang <= BIG) {
+        qFix.setFromUnitVectors(tmpV.copy(Uuse).applyQuaternion(cQ).normalize(), up);
+        cQ.premultiply(qFix);
+        fused = true; stats.fused++;
       }
-    }
-    if (ang !== null && flat && ang <= BIG) {
-      xAx.set(1, 0, 0).applyQuaternion(cQ);
-      xAx.addScaledVector(up, -xAx.dot(up));
-      if (xAx.lengthSq() < 1e-6) xAx.set(0, 1, 0).applyQuaternion(cQ).addScaledVector(up, -xAx.dot(up));
-      xAx.normalize();                                      // ось X метки, положенная «горизонтально»
-      yAx.crossVectors(up, xAx);
-      cQ.setFromRotationMatrix(basis.makeBasis(xAx, yAx, up));
-      fused = true; stats.fused++;
     }
     if (!fused && !NOGUARD) {
       toCam.copy(cPos).negate().normalize();
@@ -435,7 +424,10 @@ export function createTracker(opts) {
         }, 2500);
       }, 250);
     },
-    get flat() { return flat; },
+    get markerState() {
+      if (bigSince !== null) return 'перенастройка';
+      return markerTilt < SNAP ? 'горизонтально' : 'наклон ' + markerTilt.toFixed(0) + '°';
+    },
     // направление «вверх» (против силы тяжести) в координатах сцены метки; false — датчиков нет
     gravityInContent(out) {
       if (!(USE_IMU && imu && imu.fresh())) return false;
