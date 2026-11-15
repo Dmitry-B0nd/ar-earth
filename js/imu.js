@@ -21,15 +21,33 @@ export function createImu() {
     t = performance.now(); count++;
     const h = hist[hi = (hi + 1) % HIST]; h.t = t; h.a = alpha; h.b = beta; h.g = gamma;
   }
+  // Резкие движения: ускорение без учёта силы тяжести (м/с²) и скорость поворота (°/с).
+  // Пики копятся до чтения (для строки отладки); время последнего «рывка» — по заданным порогам.
+  let jerkA = Infinity, jerkW = Infinity, lastJerkT = -1e9, peakA = 0, peakW = 0, motionCount = 0, hasAcc = false;
+  function onMotion(e) {
+    motionCount++;
+    const a = e.acceleration, r = e.rotationRate;
+    let am = 0, wm = 0;
+    if (a && a.x != null) { am = Math.hypot(a.x, a.y, a.z); hasAcc = true; }
+    if (r && r.alpha != null) wm = Math.hypot(r.alpha, r.beta, r.gamma);
+    if (am > peakA) peakA = am;
+    if (wm > peakW) peakW = wm;
+    if (am > jerkA || wm > jerkW) lastJerkT = performance.now();
+  }
   const screenAngle = () => ((screen.orientation && screen.orientation.angle) ?? window.orientation ?? 0) * DEG;
 
   const api = {
     // Вызывать прямо в обработчике нажатия кнопки, до любых await:
     // iOS разрешает спросить доступ к датчикам только в ответ на действие пользователя.
     request() {
-      const D = window.DeviceOrientationEvent;
+      const D = window.DeviceOrientationEvent, M = window.DeviceMotionEvent;
+      // движение (акселерометр) — отдельное разрешение в iOS; спрашиваем сразу, в том же нажатии
+      const pm = M && typeof M.requestPermission === 'function'
+        ? M.requestPermission().catch((e) => { console.warn('IMU: нет доступа к акселерометру', e); return 'denied'; })
+        : Promise.resolve('granted');
       if (D && typeof D.requestPermission === 'function') {
-        return D.requestPermission().then((r) => r === 'granted').catch((e) => { console.warn('IMU: нет доступа', e); return false; });
+        const po = D.requestPermission().then((r) => r === 'granted').catch((e) => { console.warn('IMU: нет доступа', e); return false; });
+        return Promise.all([po, pm]).then(([ok]) => ok);
       }
       return Promise.resolve(!!D);
     },
@@ -37,7 +55,15 @@ export function createImu() {
       if (listening) return;
       listening = true;
       window.addEventListener('deviceorientation', onOrient);
+      window.addEventListener('devicemotion', onMotion);
     },
+    // пороги рывка: ускорение, м/с², и скорость поворота, °/с
+    setJerk(a, w) { jerkA = a; jerkW = w; },
+    get lastJerkT() { return lastJerkT; },
+    get hasMotion() { return motionCount > 0; },
+    get hasAcc() { return hasAcc; },
+    // пики с прошлого вызова (для строки отладки)
+    takePeaks() { const p = { a: peakA, w: peakW }; peakA = peakW = 0; return p; },
     get count() { return count; },
     get hasAlpha() { return hasAlpha; },
     fresh() { return performance.now() - t < 300; },

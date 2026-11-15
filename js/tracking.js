@@ -6,7 +6,7 @@ import { MindARThree } from 'mindar-image-three';
 
 export function createTracker(opts) {
   const { container, markerUrl, CF, BETA, MISS, WARM, SYNC, RAW, JUMP, NOGUARD, onFound, onLost, onStall, onFatal,
-          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60,
+          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60, JERK = 1, JERKA = 15, JERKW = 400,
           PMC = 2, PB = 5, DMC = 0.6, DB = 2, RMC, RB, DC = 1, FOV = 66 } = opts;
 
   // MindAR просит у камеры только «заднюю камеру» — iPhone тогда снимает 30 кадров/с.
@@ -151,7 +151,15 @@ export function createTracker(opts) {
     };
     loader.__imuHooked = true;
   }
-  const stats = { rejected: 0, updates: 0, fused: 0, imuAngSum: 0, imuN: 0, redetect: 0, coast: 0, pred: 0, get newFrames() { return newFrames; }, set newFrames(v) { newFrames = v; } };
+  // ---- Рывок ----
+  // На резком рывке кадр смазан, и трекер часто «тащит» позу за телефоном — сцена улетает.
+  // Акселерометр и гироскоп замечают рывок мгновенно: на это время камере не верим, сцену быстро
+  // гасим, а когда рывок кончился — заставляем трекер найти метку заново, и сцена проявляется на месте.
+  const JERK_HOLD = 150, JERK_FADE = 100;
+  if (JERK && imu && imu.setJerk) imu.setJerk(JERKA, JERKW);
+  let jerkWas = false;
+  const jerkingNow = () => !!(JERK && imu && imu.lastJerkT !== undefined && performance.now() - imu.lastJerkT < JERK_HOLD);
+  const stats = { rejected: 0, updates: 0, fused: 0, imuAngSum: 0, imuN: 0, redetect: 0, coast: 0, pred: 0, jerks: 0, get newFrames() { return newFrames; }, set newFrames(v) { newFrames = v; } };
 
   // ---- Подсказка трекеру: где метка окажется на следующем кадре ----
   // MindAR ищет каждую точку метки только в ±10 пикселях от того места, где она была на прошлом
@@ -234,6 +242,7 @@ export function createTracker(opts) {
   let frozen = false, frozenWant = false;
   anchor.onTargetUpdate = () => {
     if (frozen) return;                                     // «заморожено»: позу не трогаем
+    if (jerkingNow()) return;                               // рывок: позам с камеры не верим
     if (!anchor.group.visible) { accepted = false; suspect = 0; return; }
     const ts = mindar.controller && mindar.controller.trackingStates[0];
     if (ts && !ts.isTracking) return;                       // трекер потерял метку и повторяет старую позу
@@ -399,7 +408,8 @@ export function createTracker(opts) {
   let lostAt = null, fading = false;
   const canvas = renderer.domElement;
   canvas.style.transition = `opacity ${FADE_MS}ms ease`;
-  function fadeTo(v) {
+  function fadeTo(v, ms = FADE_MS) {
+    canvas.style.transition = `opacity ${ms}ms ease`;
     canvas.style.opacity = String(v);
     fading = v === 0;
   }
@@ -549,7 +559,19 @@ export function createTracker(opts) {
           syncCtx.drawImage(v, 0, 0, syncBg.width, syncBg.height);
         }
       }
-      const want = frozen ? frozenWant : ((anchor.group.visible && accepted) || (coastOk && now - lastGood < COAST_MS));
+      // рывок: быстро гасим; кончился — трекер ищет метку заново, сцена появится уже на новом месте
+      const jerking = !frozen && jerkingNow();
+      if (jerking && !jerkWas) {
+        jerkWas = true; stats.jerks++;
+        coasting = false; coastOk = false; lastGood = -1e9;
+        if (content.visible) { lostAt = now - HOLD_MS; fadeTo(0, JERK_FADE); }
+      } else if (!jerking && jerkWas) {
+        jerkWas = false;
+        const ts0 = mindar.controller && mindar.controller.trackingStates[0];
+        if (ts0) ts0.isTracking = false;
+        accepted = false; ready = false; pr.M = null;
+      }
+      const want = jerking ? false : frozen ? frozenWant : ((anchor.group.visible && accepted) || (coastOk && now - lastGood < COAST_MS));
       // Плавность: при потере метки сцена ещё ~0,25 с стоит на месте (короткие пропуски
       // незаметны), потом за 0,3 с растворяется; при нахождении — быстро проявляется.
       if (want) {
