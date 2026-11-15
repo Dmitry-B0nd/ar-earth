@@ -63,6 +63,13 @@ export function createTracker(opts) {
   const nrm = new THREE.Vector3(), toCam = new THREE.Vector3(), up = new THREE.Vector3();
   const xAx = new THREE.Vector3(), yAx = new THREE.Vector3(), basis = new THREE.Matrix4();
   let aS = 1, accepted = false, suspect = 0, agree = 1, fusedNow = false, badSince = null;
+  // flat — метка лежит горизонтально и наклон берём из гироскопа
+  let flat = true, bigSince = null, calmSince = null;
+  const redetects = [], BIG = 55;
+  function setFlat(on, why) {
+    flat = on; bigSince = badSince = calmSince = null; redetects.length = 0;
+    console.log('[трекинг]', on ? 'наклон снова из датчиков:' : 'только камера:', why);
+  }
   const stats = { rejected: 0, updates: 0, fused: 0, imuAngSum: 0, imuN: 0, redetect: 0 };
 
   let frozen = false, frozenWant = false;
@@ -76,25 +83,46 @@ export function createTracker(opts) {
     const s = Math.cbrt(Math.abs(cS.x * cS.y * cS.z));
     nrm.set(0, 0, 1).applyQuaternion(cQ);
 
-    let fused = false;
+    let fused = false, ang = null;
     if (USE_IMU && imu && imu.fresh()) {
       imu.upCamera(up);
-      const ang = Math.acos(Math.max(-1, Math.min(1, nrm.dot(up)))) * 180 / Math.PI;
+      ang = Math.acos(Math.max(-1, Math.min(1, nrm.dot(up)))) * 180 / Math.PI;
       stats.imuAngSum += ang; stats.imuN++;
-      // Наклон берём из датчиков ВСЕГДА (метка лежит на столе). Положение метки камера
-      // определяет надёжно даже тогда, когда ошиблась с наклоном, так что позу не выбрасываем.
-      // Но если камера долго «уверена» в неправильном наклоне, значит, трекер зацепился за
-      // ложное решение и сам с него не слезет — заставляем его найти метку заново.
+      // Метка на столе: наклон берём из датчиков (камера с наклоном ошибается, гироскоп — нет).
+      // Но метку могут показать на мониторе, повесить на стену или держать в руке — тогда
+      // гироскоп о её наклоне ничего не знает, и работаем только по камере. Различаем так:
+      //  • расхождение > 55° держится 1,2 с — метка явно не горизонтальна → только камера;
+      //  • расхождение 20–55° держится 0,7 с — скорее всего трекер «зацепился» за ложный наклон →
+      //    заставляем его найти метку заново; если перезахваты идут один за другим (3 за 8 с),
+      //    значит, метку держат под углом → только камера;
+      //  • в режиме «только камера» расхождение < 10° держится 2 с — метку положили на стол → снова датчики.
+      const now = performance.now();
       agree += 0.1 * ((ang < TOL ? 1 : 0) - agree);
-      if (ang > TOL) {
-        if (badSince === null) badSince = performance.now();
-        else if (performance.now() - badSince > 700) {
-          const ts0 = mindar.controller && mindar.controller.trackingStates[0];
-          if (ts0) ts0.isTracking = false;            // MindAR на следующем кадре распознает метку с нуля
-          badSince = null; stats.redetect++;
-          console.log('[трекинг] наклон по камере расходится с гироскопом на', ang.toFixed(0) + '° — перезахват метки');
-        }
-      } else badSince = null;
+      if (flat) {
+        if (ang > BIG) {
+          if (bigSince === null) bigSince = now;
+          else if (now - bigSince > 1200) setFlat(false, 'метка не горизонтальна (' + ang.toFixed(0) + '°)');
+        } else bigSince = null;
+        if (ang > TOL && ang <= BIG) {
+          if (badSince === null) badSince = now;
+          else if (now - badSince > 700) {
+            const ts0 = mindar.controller && mindar.controller.trackingStates[0];
+            if (ts0) ts0.isTracking = false;            // MindAR на следующем кадре распознает метку с нуля
+            badSince = null; stats.redetect++;
+            redetects.push(now);
+            while (redetects.length && now - redetects[0] > 8000) redetects.shift();
+            console.log('[трекинг] наклон по камере расходится с гироскопом на', ang.toFixed(0) + '° — перезахват метки');
+            if (redetects.length >= 3) setFlat(false, 'перезахваты не помогают — метку, видимо, держат под углом');
+          }
+        } else badSince = null;
+      } else {
+        if (ang < 10) {
+          if (calmSince === null) calmSince = now;
+          else if (now - calmSince > 2000) setFlat(true, 'метка снова лежит горизонтально');
+        } else calmSince = null;
+      }
+    }
+    if (ang !== null && flat && ang <= BIG) {
       xAx.set(1, 0, 0).applyQuaternion(cQ);
       xAx.addScaledVector(up, -xAx.dot(up));
       if (xAx.lengthSq() < 1e-6) xAx.set(0, 1, 0).applyQuaternion(cQ).addScaledVector(up, -xAx.dot(up));
@@ -123,7 +151,7 @@ export function createTracker(opts) {
   //  расстояние до метки — определяется хуже (отсюда «дыхание» размера), сглаживаем сильнее;
   //  поворот — слабо, если наклон из датчиков, и сильнее, если только по камере.
   // В каждом случае сглаживание ослабевает, пока телефон движется, — так нет запаздывания.
-  const sDir = new THREE.Vector3(), tDir = new THREE.Vector3(), sQ = new THREE.Quaternion();
+  const sDir = new THREE.Vector3(), tDir = new THREE.Vector3(), sQ = new THREE.Quaternion(), qInv = new THREE.Quaternion();
   const sPos = new THREE.Vector3(), sScale = new THREE.Vector3();
   let sDist = 1, sS = 1, ready = false, vdF = 0, vzF = 0, wF = 0, last = 0;
   const alpha = (fc, dt) => 1 / (1 + 1 / (2 * Math.PI * fc * dt));
@@ -267,6 +295,13 @@ export function createTracker(opts) {
       }
     },
     get shown() { return content.visible && !fading; },
+    get flat() { return flat; },
+    // направление «вверх» (против силы тяжести) в координатах сцены метки; false — датчиков нет
+    gravityInContent(out) {
+      if (!(USE_IMU && imu && imu.fresh())) return false;
+      imu.upCamera(out);
+      return out.applyQuaternion(qInv.copy(sQ).invert()).normalize();
+    },
     get frozen() { return frozen; },
     // «Заморозить»: останавливаем и картинку с камеры, и позу — можно опустить телефон и спокойно тапать
     setFrozen(on) {

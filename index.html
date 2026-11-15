@@ -188,13 +188,13 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=3.6';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=3.6';
-import { createImu } from './js/imu.js?v=3.6';
-import { createViewer3D } from './js/viewer3d.js?v=3.6';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=3.6';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=3.6';
-const BUILD = '3.6';
+import { createTracker } from './js/tracking.js?v=3.7';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=3.7';
+import { createImu } from './js/imu.js?v=3.7';
+import { createViewer3D } from './js/viewer3d.js?v=3.7';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=3.7';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=3.7';
+const BUILD = '3.7';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -631,7 +631,7 @@ async function start(mode) {
     if (!imu.fresh()) return 'датчики: нет данных';
     const div = st.imuN ? (st.imuAngSum / st.imuN).toFixed(1) + '°' : '—';
     const share = st.updates ? Math.round(100 * st.fused / st.updates) + '%' : '—';
-    return `датчики: ${share}  расхожд. ${div}  fov ${P.FOV || 45}°\nперезахватов: ${st.redetect}`;
+    return `датчики: ${share}  расхожд. ${div}  fov ${P.FOV || 45}°\nперезахватов: ${st.redetect}  метка: ${tracker.flat ? 'на столе' : 'не горизонтально'}`;
   };
   if (window.DEV) setInterval(() => {
     paramsBox.textContent = `сборка ${BUILD}\n` +
@@ -642,11 +642,17 @@ async function start(mode) {
     if (AR) { const st = tracker.stats; st.updates = 0; st.rejected = 0; st.fused = 0; st.imuAngSum = 0; st.imuN = 0; }
   }, 1000);
 
+  // Ось Земли всегда «вверх» по гироскопу — даже если метку показали на мониторе или держат в руке
+  const gUp = new THREE.Vector3(), zAxis = new THREE.Vector3(0, 0, 1), qEarth = new THREE.Quaternion();
   renderer.setAnimationLoop(() => {
     const now = performance.now();
     simT += Math.min(now - lastFrame, 250) * view.speed; lastFrame = now;
     simDate.setTime(simT);
     tracker.frame(now);
+    if (AR && !P.WALL && tracker.gravityInContent(gUp)) {
+      qEarth.setFromUnitVectors(zAxis, gUp);
+      earthRoot.quaternion.slerp(qEarth, 0.15);
+    }
     earth.update(simDate);
     poi.update(now / 1000, camera);
     if (sats) sats.update(simDate, renderer, earth.sunWorld, camera);
