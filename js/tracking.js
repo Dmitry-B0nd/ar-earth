@@ -234,7 +234,7 @@ export function createTracker(opts) {
     // ждём, пока прежний цикл завершит текущий кадр и выйдет (обновления прекратятся)
     const waitStart = performance.now();
     const check = () => {
-      if (frozen) { restarting = false; return; }
+      if (frozen || paused) { restarting = false; return; }
       if (performance.now() - lastProcessed > 250 || performance.now() - waitStart > 2000) {
         ctrl.processVideo(mindar.video);
         restarting = false;
@@ -247,10 +247,10 @@ export function createTracker(opts) {
   // iOS при повороте меняет ориентацию видео с камеры (480×640 ↔ 640×480), а MindAR настраивает
   // распознавание на размер кадра один раз при запуске — дальше кадры читаются с перекосом.
   // Если размер кадра изменился и держится, перезапускаем камеру и распознавание под новый размер.
-  let arRestarting = false, dimsSince = null;
+  let arRestarting = false, dimsSince = null, paused = false;
   function checkVideoSize() {
     const v = mindar.video, c = mindar.controller;
-    if (arRestarting || frozen || !v || !c || !v.videoWidth) { dimsSince = null; return; }
+    if (arRestarting || frozen || paused || !v || !c || !v.videoWidth) { dimsSince = null; return; }
     if (v.videoWidth !== c.inputWidth || v.videoHeight !== c.inputHeight) {
       if (dimsSince === null) dimsSince = performance.now();
       else if (performance.now() - dimsSince > 600) {
@@ -275,6 +275,7 @@ export function createTracker(opts) {
       countProcessed();
       lastProcessed = performance.now();
       console.log('[камера] готово, кадр', mindar.video.videoWidth + '×' + mindar.video.videoHeight);
+      if (paused) mindar.controller.stopProcessVideo();     // пока перезапускались, телефон снова повернули
     } catch (e) {
       console.error('[камера] перезапуск не удался:', e);
       onStall && onStall();
@@ -286,11 +287,11 @@ export function createTracker(opts) {
     countProcessed();
     let lastVideoTime = -1, videoStuckSince = null, stalls = 0;
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden && !frozen && !arRestarting) { mindar.video.play().catch(() => {}); lastProcessed = performance.now(); }
+      if (!document.hidden && !frozen && !paused && !arRestarting) { mindar.video.play().catch(() => {}); lastProcessed = performance.now(); }
     });
     setInterval(checkVideoSize, 300);
     setInterval(() => {
-      if (frozen || document.hidden || arRestarting) { videoStuckSince = null; return; }
+      if (frozen || paused || document.hidden || arRestarting) { videoStuckSince = null; lastProcessed = performance.now(); return; }
       const v = mindar.video, now = performance.now();
       // видео стоит на месте?
       if (v.currentTime === lastVideoTime) {
@@ -342,6 +343,21 @@ export function createTracker(opts) {
     },
     get shown() { return content.visible && !fading; },
     get restarting() { return arRestarting; },
+    // Пауза распознавания (телефон повёрнут горизонтально). Камера продолжает работать,
+    // поэтому после возврата в вертикальное положение всё продолжается сразу, без перезапуска.
+    setPaused(on) {
+      if (on === paused) return;
+      paused = on;
+      if (on) {
+        if (!arRestarting && mindar.controller) mindar.controller.stopProcessVideo();
+        accepted = false; ready = false;
+      } else if (!frozen && !arRestarting) {
+        const v = mindar.video, c = mindar.controller;
+        // размер кадра мог ещё не вернуться — подождём, сторож размера перезапустит при необходимости
+        if (v && c && v.videoWidth === c.inputWidth && v.videoHeight === c.inputHeight) restartProcessing();
+        else lastProcessed = performance.now();
+      }
+    },
     get flat() { return flat; },
     // направление «вверх» (против силы тяжести) в координатах сцены метки; false — датчиков нет
     gravityInContent(out) {

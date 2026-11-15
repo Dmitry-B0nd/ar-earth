@@ -103,6 +103,16 @@
   }
   #hint img { width: 120px; height: 120px; border-radius: 6px; opacity: .9; animation: hintPulse 2s ease-in-out infinite; }
   @keyframes hintPulse { 50% { transform: scale(.92); opacity: .6; } }
+  #rotate {
+    position: fixed; inset: 0; z-index: 20; display: none; flex-direction: column; align-items: center;
+    justify-content: center; gap: 18px; background: #0a1430; color: #eef2fa; font-size: 18px; text-align: center; padding: 24px;
+  }
+  #rotate .phone {
+    width: 46px; height: 78px; border: 4px solid #eef2fa; border-radius: 10px; position: relative;
+    animation: rotPhone 2.2s ease-in-out infinite;
+  }
+  #rotate .phone::after { content: ''; position: absolute; left: 50%; bottom: 5px; width: 10px; height: 3px; margin-left: -5px; border-radius: 2px; background: #eef2fa; }
+  @keyframes rotPhone { 0%, 25% { transform: rotate(-90deg); } 60%, 100% { transform: rotate(0deg); } }
   #stall {
     position: fixed; left: 10px; right: 10px; top: calc(env(safe-area-inset-top, 0px) + 12px); z-index: 8; display: none;
     max-width: 420px; margin: 0 auto; padding: 12px 14px; border-radius: 14px; align-items: center; gap: 10px;
@@ -173,6 +183,7 @@
 </div>
 <div id="hint"><img src="img/marker-hint.png" alt=""><div>Наведите камеру на метку</div></div>
 <button id="freezeBtn">Заморозить</button>
+<div id="rotate"><div class="phone"></div><div>Поверните телефон вертикально</div></div>
 <div id="stall"><span>Камера перестала отвечать</span><button onclick="location.reload()">Перезапустить</button></div>
 <div id="overlay">
   <h1>Земля и спутники</h1>
@@ -188,13 +199,13 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=3.8';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=3.8';
-import { createImu } from './js/imu.js?v=3.8';
-import { createViewer3D } from './js/viewer3d.js?v=3.8';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=3.8';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=3.8';
-const BUILD = '3.8';
+import { createTracker } from './js/tracking.js?v=3.9';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=3.9';
+import { createImu } from './js/imu.js?v=3.9';
+import { createViewer3D } from './js/viewer3d.js?v=3.9';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=3.9';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=3.9';
+const BUILD = '3.9';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -642,6 +653,27 @@ async function start(mode) {
       imuLine();
     if (AR) { const st = tracker.stats; st.updates = 0; st.rejected = 0; st.fused = 0; st.imuAngSum = 0; st.imuN = 0; }
   }, 1000);
+
+  // ---- Горизонтальная ориентация: в AR показываем заставку и ставим распознавание на паузу ----
+  if (AR) {
+    const rotateEl = document.getElementById('rotate');
+    const isLandscape = () => window.innerWidth > window.innerHeight;
+    let landscapeTimer = null;
+    const onOrient = () => {
+      clearTimeout(landscapeTimer);
+      // небольшая задержка: во время поворота размеры окна «прыгают»
+      landscapeTimer = setTimeout(() => {
+        const land = isLandscape();
+        rotateEl.style.display = land ? 'flex' : 'none';
+        tracker.setPaused(land);
+        if (land) console.log('[экран] горизонтально — пауза');
+        else console.log('[экран] вертикально — продолжаем');
+      }, 250);
+    };
+    window.addEventListener('resize', onOrient);
+    window.addEventListener('orientationchange', onOrient);
+    onOrient();
+  }
 
   // Ось Земли всегда «вверх» по гироскопу — даже если метку показали на мониторе или держат в руке
   const gUp = new THREE.Vector3(), zAxis = new THREE.Vector3(0, 0, 1), qEarth = new THREE.Quaternion();
