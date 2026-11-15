@@ -5,7 +5,7 @@ import * as THREE from 'three';
 import { MindARThree } from 'mindar-image-three';
 
 export function createTracker(opts) {
-  const { container, markerUrl, CF, BETA, MISS, WARM, SYNC, RAW, JUMP, NOGUARD, onFound, onLost, onStall,
+  const { container, markerUrl, CF, BETA, MISS, WARM, SYNC, RAW, JUMP, NOGUARD, onFound, onLost, onStall, onFatal,
           imu, USE_IMU = true, TOL = 20,
           PMC = 2, PB = 5, DMC = 0.6, DB = 2, RMC, RB, DC = 1, FOV = 66 } = opts;
 
@@ -14,6 +14,10 @@ export function createTracker(opts) {
     filterMinCF: CF, filterBeta: BETA, missTolerance: MISS, warmupTolerance: WARM,
   });
   const { renderer, scene, camera } = mindar;
+  // MindAR рисует с плотностью пикселей экрана (у айфона ×3) и сглаживанием — это много видеопамяти.
+  // При повороте экрана буферы пересоздаются, и iOS может отобрать у страницы графический контекст
+  // распознавания. Ограничиваем ×2: на глаз почти не отличить, памяти в 2,25 раза меньше.
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   const anchor = mindar.addAnchor(0);
 
   // ---- 0. Настоящий угол обзора камеры ----
@@ -221,10 +225,10 @@ export function createTracker(opts) {
   // ---- 5. Сторож: камера или распознавание могут «зависнуть» (iOS при сворачивании Safari
   // приостанавливает видео; при быстрой разморозке мог запуститься второй цикл обработки).
   // Если кадры перестали обрабатываться — перезапускаем; не помогло — просим перезагрузку.
-  let lastProcessed = performance.now(), loopRuns = 0, restarting = false, stallReported = false;
+  let lastProcessed = performance.now(), realProcessed = performance.now(), loopRuns = 0, restarting = false, stallReported = false;
   function countProcessed() {
     const ctrl = mindar.controller, orig = ctrl.onUpdate;
-    ctrl.onUpdate = (data) => { if (data.type === 'processDone') { lastProcessed = performance.now(); loopRuns++; } orig(data); };
+    ctrl.onUpdate = (data) => { if (data.type === 'processDone') { lastProcessed = realProcessed = performance.now(); loopRuns++; } orig(data); };
   }
   function restartProcessing() {
     if (restarting) return;
@@ -247,7 +251,22 @@ export function createTracker(opts) {
   // iOS при повороте меняет ориентацию видео с камеры (480×640 ↔ 640×480), а MindAR настраивает
   // распознавание на размер кадра один раз при запуске — дальше кадры читаются с перекосом.
   // Если размер кадра изменился и держится, перезапускаем камеру и распознавание под новый размер.
-  let arRestarting = false, dimsSince = null, paused = false;
+  let arRestarting = false, dimsSince = null, paused = false, resumeTimer = null;
+  // диагностика состояния камеры и графики — пишется в консоль
+  function diag(when) {
+    const v = mindar.video, tr = v && v.srcObject && v.srcObject.getVideoTracks()[0];
+    console.log(`[диагностика: ${when}] видео ${v ? v.videoWidth + '×' + v.videoHeight : '—'}, ` +
+      `пауза ${v ? v.paused : '—'}, готовность ${v ? v.readyState : '—'}, ` +
+      `камера ${tr ? tr.readyState + (tr.muted ? ', muted' : '') + (tr.enabled ? '' : ', disabled') : '—'}, ` +
+      `распознавание ${mindar.controller ? mindar.controller.inputWidth + '×' + mindar.controller.inputHeight : '—'}, ` +
+      `потерь WebGL: ${window.__glLost || 0}`);
+  }
+  // потеря графического контекста — распознавание после неё само не оживёт
+  window.addEventListener('gl-lost', () => {
+    if (!mindar.controller) return;
+    diag('потерян WebGL');
+    onFatal && onFatal('потерян графический контекст');
+  });
   function checkVideoSize() {
     const v = mindar.video, c = mindar.controller;
     if (arRestarting || frozen || paused || !v || !c || !v.videoWidth) { dimsSince = null; return; }
@@ -305,7 +324,7 @@ export function createTracker(opts) {
         console.warn('[сторож] распознавание не отвечает', Math.round(now - lastProcessed), 'мс — перезапуск №' + stalls);
         restartProcessing();
         if (stalls >= 3 && !stallReported) { stallReported = true; onStall && onStall(); }
-      } else if (now - lastProcessed < 500) stalls = 0;
+      } else if (now - realProcessed < 500) stalls = 0;      // сбрасываем, только если кадры правда идут
     }, 1000);
   }
 
@@ -348,15 +367,37 @@ export function createTracker(opts) {
     setPaused(on) {
       if (on === paused) return;
       paused = on;
+      clearTimeout(resumeTimer);
       if (on) {
         if (!arRestarting && mindar.controller) mindar.controller.stopProcessVideo();
         accepted = false; ready = false;
-      } else if (!frozen && !arRestarting) {
-        const v = mindar.video, c = mindar.controller;
-        // размер кадра мог ещё не вернуться — подождём, сторож размера перезапустит при необходимости
-        if (v && c && v.videoWidth === c.inputWidth && v.videoHeight === c.inputHeight) restartProcessing();
-        else lastProcessed = performance.now();
+        return;
       }
+      // Возврат в вертикальное положение. Ждём, пока iOS закончит поворот, поправляем раскладку
+      // и продолжаем. Дальше проверяем, ожило ли распознавание: если нет — перезапускаем камеру,
+      // а если и это не помогло — сообщаем наружу (страницу придётся перезагрузить).
+      lastProcessed = performance.now();
+      resumeTimer = setTimeout(async () => {
+        if (paused || frozen) return;
+        try { mindar.resize(); } catch (e) {}
+        diag('после поворота');
+        const t0 = performance.now();
+        if (!arRestarting) {
+          const v = mindar.video, c = mindar.controller;
+          if (v && c && v.videoWidth === c.inputWidth && v.videoHeight === c.inputHeight) restartProcessing();
+        }
+        resumeTimer = setTimeout(async () => {
+          if (paused || frozen || realProcessed > t0) return;          // кадры пошли — всё хорошо
+          console.warn('[камера] после поворота распознавание не ожило — перезапуск камеры');
+          await restartAR('после поворота');
+          const t1 = performance.now();
+          resumeTimer = setTimeout(() => {
+            if (paused || frozen || realProcessed > t1) return;
+            diag('не помог перезапуск');
+            onFatal && onFatal('после поворота распознавание не восстановилось');
+          }, 3500);
+        }, 2500);
+      }, 400);
     },
     get flat() { return flat; },
     // направление «вверх» (против силы тяжести) в координатах сцены метки; false — датчиков нет

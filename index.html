@@ -145,6 +145,25 @@
 
 <!-- Отладочная консоль (шестерёнка в углу) — только в режиме разработчика: ?dev=1 -->
 <script>
+  // Следим за потерей WebGL-контекстов (iOS может отобрать их при нехватке видеопамяти)
+  window.__glLost = 0;
+  for (const C of [window.HTMLCanvasElement, window.OffscreenCanvas]) {
+    if (!C || !C.prototype.getContext) continue;
+    const orig = C.prototype.getContext;
+    C.prototype.getContext = function (type, ...rest) {
+      const ctx = orig.call(this, type, ...rest);
+      if (ctx && /webgl/i.test(type) && !this.__glWatch) {
+        this.__glWatch = true;
+        const canvas = this;
+        canvas.addEventListener('webglcontextlost', () => {
+          window.__glLost++;
+          console.error('[gpu] потерян WebGL-контекст, холст', canvas.width + '×' + canvas.height);
+          window.dispatchEvent(new Event('gl-lost'));
+        });
+      }
+      return ctx;
+    };
+  }
   window.T0 = performance.now();
   window.DEV = /[?&]dev=1(&|$)/.test(location.search);
   if (window.DEV) document.write('<script src="js/vendor/eruda/eruda.min.js"><\/script><script>eruda.init()<\/script>');
@@ -199,13 +218,13 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=3.9';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=3.9';
-import { createImu } from './js/imu.js?v=3.9';
-import { createViewer3D } from './js/viewer3d.js?v=3.9';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=3.9';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=3.9';
-const BUILD = '3.9';
+import { createTracker } from './js/tracking.js?v=4.0';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=4.0';
+import { createImu } from './js/imu.js?v=4.0';
+import { createViewer3D } from './js/viewer3d.js?v=4.0';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=4.0';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.0';
+const BUILD = '4.0';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -345,6 +364,11 @@ async function start(mode) {
     onFound: () => { status.textContent = 'Метка найдена'; status.classList.add('found'); },
     onLost:  () => { status.textContent = 'Ищу метку…';   status.classList.remove('found'); },
     onStall: () => { document.getElementById('stall').style.display = 'flex'; },
+    onFatal: (why) => {
+      console.error('[камера] восстановление через перезагрузку:', why);
+      try { sessionStorage.setItem('ar-resume', why); } catch (e) {}
+      setTimeout(() => location.reload(), 300);
+    },
   }) : createViewer3D({ container });
   const { renderer, scene, camera, content } = tracker;
   if (window.DEV) window.__tracker = tracker;      // для отладки из консоли
@@ -705,6 +729,18 @@ window.addEventListener('unhandledrejection', (ev) => {
   console.error('Необработанная ошибка:', e, e && e.stack);
   showError('Что-то пошло не так: <b>' + (e && e.message ? e.message : e) + '</b><br>Попробуйте обновить страницу или смотрите без камеры.');
 });
+
+// После автоматической перезагрузки (камера не восстановилась) — одна кнопка, чтобы продолжить.
+// Нажатие нужно: без него iOS не даст доступ к датчикам движения.
+try {
+  const why = sessionStorage.getItem('ar-resume');
+  if (why) {
+    sessionStorage.removeItem('ar-resume');
+    console.warn('[камера] страница перезагружена:', why);
+    msg.innerHTML = 'Камеру пришлось перезапустить.<br>Нажмите, чтобы продолжить.';
+    btn.textContent = 'Продолжить';
+  }
+} catch (e) {}
 
 btn.addEventListener('click', () => start('ar'));
 btn3d.addEventListener('click', () => start('3d'));
