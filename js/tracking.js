@@ -6,7 +6,7 @@ import { MindARThree } from 'mindar-image-three';
 
 export function createTracker(opts) {
   const { container, markerUrl, CF, BETA, MISS, WARM, SYNC, RAW, JUMP, NOGUARD, onFound, onLost, onStall, onFatal,
-          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 1000,
+          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500,
           PMC = 2, PB = 5, DMC = 0.6, DB = 2, RMC, RB, DC = 1, FOV = 66 } = opts;
 
   const mindar = new MindARThree({
@@ -113,22 +113,26 @@ export function createTracker(opts) {
     const orig = loader.loadInput.bind(loader);
     loader.loadInput = (input) => {
       if (imu && imu.fresh() && imu.hasAlpha) { imu.worldFromCamera(qWCframe, IMULAG); haveFrameQ = true; } else haveFrameQ = false;
-      frameUpdated = false;
+      frameUpdated = false; frameT = performance.now();
       return orig(input);
     };
     loader.__imuHooked = true;
   }
   const stats = { rejected: 0, updates: 0, fused: 0, imuAngSum: 0, imuN: 0, redetect: 0, coast: 0 };
 
-  // ---- Положение метки «в комнате» и удержание сцены по гироскопу ----
-  // Когда поворот берётся из гироскопа, положение метки тоже храним в координатах комнаты
-  // (с началом в телефоне): при повороте телефона оно не меняется, поэтому сглаживание
-  // не отстаёт. А если на резком движении камера на мгновение потеряла метку (смаз),
-  // сцену держит на месте гироскоп — до COAST_MS, пока метка по расчёту остаётся в кадре.
+  // ---- Удержание сцены, когда камера на мгновение потеряла метку (смаз при резком движении) ----
+  // Сцена в это время не стоит на месте экрана, а движется так, как двигалась бы метка:
+  //  • поворот телефона берём из гироскопа (точно);
+  //  • сдвиг телефона гироскоп не видит, поэтому продолжаем то движение метки «по комнате»,
+  //    которое камера видела последние доли секунды (например, когда обходят метку по кругу).
+  // Держим не дольше COAST_MS и только пока метка по расчёту остаётся в кадре.
   const COAST_MS = COAST;
-  const wPos = new THREE.Vector3(), qWCuse = new THREE.Quaternion(), qCW = new THREE.Quaternion();
-  const outPos = new THREE.Vector3(), outQ = new THREE.Quaternion(), proj = new THREE.Vector3();
-  let worldMode = false, lastGood = -1e9, frameUpdated = false, posSuspect = 0;
+  const qWCgood = new THREE.Quaternion(), qCW = new THREE.Quaternion(), proj = new THREE.Vector3();
+  const uW = new THREE.Vector3(), uPrev = new THREE.Vector3(), vW = new THREE.Vector3(), vInst = new THREE.Vector3();
+  const uStart = new THREE.Vector3(), uNow = new THREE.Vector3();
+  let lastGood = -1e9, tGoodFrame = 0, tPrevFrame = 0, havePrev = false, frameUpdated = false, frameT = 0;
+  let coasting = false, coastOk = false;
+  const VMAX = 0.0025;                       // предел скорости метки «по комнате» для продолжения, рад/мс
 
   let frozen = false, frozenWant = false;
   anchor.onTargetUpdate = () => {
@@ -190,21 +194,19 @@ export function createTracker(opts) {
     }
     const now = performance.now();
     if (fused) {
-      // положение метки в комнате; резкий скачок относительно сглаженного — скорее всего, смаз:
-      // несколько кадров не верим камере (сцену держит гироскоп), потом принимаем
-      wPos.copy(cPos).applyQuaternion(qWC);
-      if (worldMode && ready && now - lastGood < 300) {
-        const d = wPos.distanceTo(sPos) / sDist;
-        if (d > 0.25 && posSuspect < 4) { posSuspect++; stats.rejected++; return; }
-      }
-      posSuspect = 0;
-      if (!worldMode || now - lastGood > 300) { worldMode = true; ready = false; }
-      qWCuse.copy(qWC);
-      aPos.copy(wPos); aQ.copy(qMW);
-    } else {
-      if (worldMode) { worldMode = false; ready = false; }
-      aPos.copy(cPos); aQ.copy(cQ);
-    }
+      // как метка движется «по комнате» (без учёта поворота телефона) — для продолжения при потере
+      uW.copy(cPos).normalize().applyQuaternion(qWC);
+      const dt = frameT - tPrevFrame;
+      if (havePrev && dt > 5 && dt < 200) {
+        vInst.copy(uW).sub(uPrev).divideScalar(dt);
+        vW.lerp(vInst, 0.3);
+        if (vW.length() > VMAX) vW.setLength(VMAX);
+      } else vW.set(0, 0, 0);
+      uPrev.copy(uW); tPrevFrame = frameT; havePrev = true;
+      qWCgood.copy(qWC); tGoodFrame = frameT;
+    } else havePrev = false;
+    coasting = false; coastOk = false;
+    aPos.copy(cPos); aQ.copy(cQ);
     suspect = 0;
     fusedNow = fused;
     aS = s; accepted = true; lastGood = now; frameUpdated = true;
@@ -223,7 +225,7 @@ export function createTracker(opts) {
   const angle = (u, v) => Math.acos(Math.max(-1, Math.min(1, u.dot(v))));
   function smoothPose(now) {
     if (frozen) return;
-    if (!(anchor.group.visible && accepted)) { if (!canCoast(now)) ready = false; last = now; return; }
+    if (!(anchor.group.visible && accepted)) { if (!coastOk) ready = false; last = now; return; }
     const dist = aPos.length();
     tDir.copy(aPos).divideScalar(dist);
     if (!ready || RAW) {
@@ -242,22 +244,28 @@ export function createTracker(opts) {
     }
     last = now;
     sPos.copy(sDir).multiplyScalar(sDist);
-    composeContent();
+    content.matrix.compose(sPos, sQ, sScale.set(sS, sS, sS));
   }
-  // в «мировом» режиме переводим сглаженную позу из комнаты в камеру по ориентации телефона qWCuse
-  function composeContent() {
-    if (worldMode) {
-      qCW.copy(qWCuse).invert();
-      outPos.copy(sPos).applyQuaternion(qCW);
-      outQ.copy(qCW).multiply(sQ);
-      content.matrix.compose(outPos, outQ, sScale.set(sS, sS, sS));
-    } else content.matrix.compose(sPos, sQ, sScale.set(sS, sS, sS));
-  }
-  // можно ли сейчас держать сцену по одному гироскопу (метка недавно была и по расчёту в кадре)
-  function canCoast(now) {
-    if (!(worldMode && ready && imu && imu.fresh()) || now - lastGood > COAST_MS) return false;
-    proj.copy(sPos).applyQuaternion(qCW.copy(qWCuse).invert()).project(camera);
-    return proj.z < 1 && Math.abs(proj.x) < 1.1 && Math.abs(proj.y) < 1.1;
+  // Удержание: ставим сцену туда, где метка должна быть при ориентации телефона qWCnow в момент tNow.
+  // Возвращает false, если удерживать нельзя (давно не было метки, нет датчиков, метка ушла из кадра).
+  function coast(qWCnow, tNow) {
+    // после COAST_MS сцена растворяется, но и во время растворения продолжает двигаться вместе с меткой
+    const since = performance.now() - lastGood;
+    if (!(fusedNow && ready && haveMW && imu && imu.fresh()) || since > COAST_MS + FADE_MS) return (coastOk = false);
+    if (!coasting) { uStart.copy(sDir).applyQuaternion(qWCgood); coasting = true; }   // откуда продолжаем
+    const d = Math.max(0, tNow - tGoodFrame);
+    uNow.copy(vW).multiplyScalar(d).add(uStart).normalize();
+    qCW.copy(qWCnow).invert();
+    proj.copy(uNow).applyQuaternion(qCW).multiplyScalar(sDist);
+    const p = proj.clone().project(camera);
+    if (!(p.z < 1 && Math.abs(p.x) < 1.1 && Math.abs(p.y) < 1.1)) return (coastOk = false);
+    sDir.copy(uNow).applyQuaternion(qCW);
+    sQ.copy(qCW).multiply(qMW);
+    sPos.copy(sDir).multiplyScalar(sDist);
+    last = performance.now();
+    content.matrix.compose(sPos, sQ, sScale.set(sS, sS, sS));
+    stats.coast++;
+    return (coastOk = since <= COAST_MS);
   }
 
   // ---- 3. Синхронизация видео с трекером ----
@@ -309,9 +317,7 @@ export function createTracker(opts) {
       if (data.type === 'processDone') {
         lastProcessed = realProcessed = performance.now(); loopRuns++;
         // кадр обработан, а позы нет (смаз, перезахват) — поворачиваем сцену по гироскопу этого кадра
-        if (SYNC && !frozen && !frameUpdated && haveFrameQ && canCoast(realProcessed)) {
-          qWCuse.copy(qWCframe); composeContent(); stats.coast++;
-        }
+        if (SYNC && !frozen && !frameUpdated && haveFrameQ) coast(qWCframe, frameT);
       }
       orig(data);
     };
@@ -417,7 +423,7 @@ export function createTracker(opts) {
   return {
     mindar, renderer, scene, camera, content, stats, intrinsics,
     get agree() { return agree; },
-    get debug() { return { worldMode, ready, sinceGood: Math.round(performance.now() - lastGood), frameUpdated, haveFrameQ, imuFresh: !!(imu && imu.fresh()), coast: canCoast(performance.now()), proj: proj.toArray().map((v) => +v.toFixed(2)) }; },
+    get debug() { return { ready, sinceGood: Math.round(performance.now() - lastGood), coasting, coastOk, v: +(vW.length() * 1000 * 57.3).toFixed(1) }; },
     async start() {
       mindar.ui.showLoading();
       let t = performance.now();
@@ -434,10 +440,7 @@ export function createTracker(opts) {
     },
     // вызывать каждый кадр перед отрисовкой
     frame(now) {
-      const live = !SYNC || now - realProcessed > 150;          // на экране живое видео, а не обработанный кадр
-      if (live && worldMode && !frozen && imu && imu.fresh()) imu.worldFromCamera(qWCuse, 0);
       if (!SYNC) smoothPose(now);
-      else if (live && !frozen && canCoast(now)) composeContent();
       // Если распознавание не выдаёт кадров (пауза, запуск после поворота, перезапуск),
       // показываем живое видео, чтобы картинка с камеры не замирала. При заморозке — не трогаем.
       if (SYNC && syncBg && syncCtx && !frozen && now - realProcessed > 150) {
@@ -447,14 +450,14 @@ export function createTracker(opts) {
           syncCtx.drawImage(v, 0, 0, syncBg.width, syncBg.height);
         }
       }
-      const want = frozen ? frozenWant : ((anchor.group.visible && accepted) || canCoast(now));
+      const want = frozen ? frozenWant : ((anchor.group.visible && accepted) || (coastOk && now - lastGood < COAST_MS));
       // Плавность: при потере метки сцена ещё ~0,25 с стоит на месте (короткие пропуски
       // незаметны), потом за 0,3 с растворяется; при нахождении — быстро проявляется.
       if (want) {
         lostAt = null;
         if (!content.visible || fading) { content.visible = true; fadeTo(1); }   // в т.ч. если нашлась посреди растворения
       } else if (content.visible) {
-        if (lostAt === null) lostAt = now;
+        if (lostAt === null) lostAt = coasting ? now - HOLD_MS : now;   // после удержания — сразу растворяем
         if (now - lostAt > HOLD_MS && !fading) fadeTo(0);
         if (now - lostAt > HOLD_MS + FADE_MS) content.visible = false;
       }

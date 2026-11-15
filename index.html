@@ -218,13 +218,13 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=4.5';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=4.5';
-import { createImu } from './js/imu.js?v=4.5';
-import { createViewer3D } from './js/viewer3d.js?v=4.5';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=4.5';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.5';
-const BUILD = '4.5';
+import { createTracker } from './js/tracking.js?v=4.6';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=4.6';
+import { createImu } from './js/imu.js?v=4.6';
+import { createViewer3D } from './js/viewer3d.js?v=4.6';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=4.6';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.6';
+const BUILD = '4.6';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -243,7 +243,7 @@ const P = {
   // датчики телефона: наклон метки берём из гироскопа (метка лежит на столе)
   // поворот сцены — из гироскопа, камера медленно подправляет (kmw); imulag — задержка кадра камеры, мс
   USE_IMU: q.get('imu') !== '0' && q.get('mount') !== 'wall', TOL: num('tol', 20),
-  IMULAG: num('imulag', 0), KMW: num('kmw', 0.03), COAST: num('coast', 1000),
+  IMULAG: num('imulag', 0), KMW: num('kmw', 0.03), COAST: num('coast', 500),
   // угол обзора камеры телефона по длинной стороне кадра, градусы (0 = как в MindAR по умолчанию, 45°)
   FOV: num('fov', 66),
   RAW: q.get('raw') === '1', JUMP: num('jump', 25), NOGUARD: q.get('noguard') === '1',
