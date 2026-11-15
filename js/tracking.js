@@ -181,10 +181,16 @@ export function createTracker(opts) {
   }
 
   // ---- 3. Синхронизация видео с трекером ----
+  let syncBg = null, syncTimer = null;
+  function teardownSync() {
+    clearInterval(syncTimer); syncTimer = null;
+    if (syncBg) { syncBg.remove(); syncBg = null; }
+  }
   function setupSync() {
+    teardownSync();
     const v = mindar.video;
     const src = mindar.controller.inputLoader.context.canvas;
-    const bg = document.createElement('canvas');
+    const bg = syncBg = document.createElement('canvas');
     bg.width = src.width; bg.height = src.height;
     bg.style.position = 'absolute'; bg.style.zIndex = '-1';
     const bgCtx = bg.getContext('2d');
@@ -193,7 +199,7 @@ export function createTracker(opts) {
     const syncStyle = () => {
       for (const k of ['top', 'left', 'width', 'height']) if (bg.style[k] !== v.style[k]) bg.style[k] = v.style[k];
     };
-    syncStyle(); setInterval(syncStyle, 500);
+    syncStyle(); syncTimer = setInterval(syncStyle, 500);
     const ctrl = mindar.controller;
     const origUpdate = ctrl.onUpdate;
     ctrl.onUpdate = (data) => {
@@ -237,14 +243,54 @@ export function createTracker(opts) {
     };
     setTimeout(check, 60);
   }
+  // ---- 6. Поворот телефона ----
+  // iOS при повороте меняет ориентацию видео с камеры (480×640 ↔ 640×480), а MindAR настраивает
+  // распознавание на размер кадра один раз при запуске — дальше кадры читаются с перекосом.
+  // Если размер кадра изменился и держится, перезапускаем камеру и распознавание под новый размер.
+  let arRestarting = false, dimsSince = null;
+  function checkVideoSize() {
+    const v = mindar.video, c = mindar.controller;
+    if (arRestarting || frozen || !v || !c || !v.videoWidth) { dimsSince = null; return; }
+    if (v.videoWidth !== c.inputWidth || v.videoHeight !== c.inputHeight) {
+      if (dimsSince === null) dimsSince = performance.now();
+      else if (performance.now() - dimsSince > 600) {
+        dimsSince = null;
+        restartAR(`кадр ${c.inputWidth}×${c.inputHeight} → ${v.videoWidth}×${v.videoHeight}`);
+      }
+    } else dimsSince = null;
+  }
+  async function restartAR(reason) {
+    if (arRestarting) return;
+    arRestarting = true;
+    console.log('[камера] перезапуск:', reason);
+    accepted = false; ready = false; badSince = bigSince = null;
+    const old = mindar.controller;
+    try { mindar.stop(); } catch (e) { console.warn('stop:', e); }
+    try { old && old.worker && old.worker.terminate(); } catch (e) {}
+    teardownSync();
+    try {
+      await mindar._startVideo();
+      await mindar._startAR();
+      if (SYNC) setupSync();
+      countProcessed();
+      lastProcessed = performance.now();
+      console.log('[камера] готово, кадр', mindar.video.videoWidth + '×' + mindar.video.videoHeight);
+    } catch (e) {
+      console.error('[камера] перезапуск не удался:', e);
+      onStall && onStall();
+    }
+    arRestarting = false;
+  }
+
   function startWatchdog() {
     countProcessed();
     let lastVideoTime = -1, videoStuckSince = null, stalls = 0;
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden && !frozen) { mindar.video.play().catch(() => {}); lastProcessed = performance.now(); }
+      if (!document.hidden && !frozen && !arRestarting) { mindar.video.play().catch(() => {}); lastProcessed = performance.now(); }
     });
+    setInterval(checkVideoSize, 300);
     setInterval(() => {
-      if (frozen || document.hidden) { videoStuckSince = null; return; }
+      if (frozen || document.hidden || arRestarting) { videoStuckSince = null; return; }
       const v = mindar.video, now = performance.now();
       // видео стоит на месте?
       if (v.currentTime === lastVideoTime) {
@@ -295,6 +341,7 @@ export function createTracker(opts) {
       }
     },
     get shown() { return content.visible && !fading; },
+    get restarting() { return arRestarting; },
     get flat() { return flat; },
     // направление «вверх» (против силы тяжести) в координатах сцены метки; false — датчиков нет
     gravityInContent(out) {
@@ -305,7 +352,7 @@ export function createTracker(opts) {
     get frozen() { return frozen; },
     // «Заморозить»: останавливаем и картинку с камеры, и позу — можно опустить телефон и спокойно тапать
     setFrozen(on) {
-      if (on === frozen) return;
+      if (on === frozen || arRestarting) return;
       frozen = on;
       frozenWant = on && content.visible;
       const ctrl = mindar.controller;

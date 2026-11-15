@@ -188,13 +188,13 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=3.7';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=3.7';
-import { createImu } from './js/imu.js?v=3.7';
-import { createViewer3D } from './js/viewer3d.js?v=3.7';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=3.7';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=3.7';
-const BUILD = '3.7';
+import { createTracker } from './js/tracking.js?v=3.8';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=3.8';
+import { createImu } from './js/imu.js?v=3.8';
+import { createViewer3D } from './js/viewer3d.js?v=3.8';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=3.8';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=3.8';
+const BUILD = '3.8';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -336,6 +336,7 @@ async function start(mode) {
     onStall: () => { document.getElementById('stall').style.display = 'flex'; },
   }) : createViewer3D({ container });
   const { renderer, scene, camera, content } = tracker;
+  if (window.DEV) window.__tracker = tracker;      // для отладки из консоли
 
   // ---------- Сцена ----------
   const earthRoot = new THREE.Group();
@@ -649,7 +650,7 @@ async function start(mode) {
     simT += Math.min(now - lastFrame, 250) * view.speed; lastFrame = now;
     simDate.setTime(simT);
     tracker.frame(now);
-    if (AR && !P.WALL && tracker.gravityInContent(gUp)) {
+    if (AR && !P.WALL && !tracker.frozen && tracker.gravityInContent(gUp)) {   // при заморозке ось не трогаем
       qEarth.setFromUnitVectors(zAxis, gUp);
       earthRoot.quaternion.slerp(qEarth, 0.15);
     }
