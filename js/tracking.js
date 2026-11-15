@@ -688,11 +688,10 @@ export function createTracker(opts) {
     },
     get frozen() { return frozen; },
     get loops() { return loopRuns; },
-    // Лёгкий режим для слабых телефонов: рендер 1:1 (без удвоения пикселей) и камера 30 кадров/с —
-    // освобождаем видеокарту и процессор для распознавания метки.
+    // Лёгкий режим для слабых телефонов: камера 30 кадров/с (слабый трекер больше не успевает).
+    // Чёткость рендера НЕ понижаем: на старом Android (трекер 15 Гц) это не ускорило трекер —
+    // он упирается в процессор, а не в видеокарту, — а картинка становилась мыльной.
     setLite(on) {
-      renderer.setPixelRatio(on ? 1 : Math.min(window.devicePixelRatio || 1, 2));
-      try { mindar.resize(); } catch (e) {}
       const v = mindar.video, trk = v && v.srcObject && v.srcObject.getVideoTracks()[0];
       const fps = on ? 30 : CAMFPS;
       if (trk && trk.applyConstraints && fps) trk.applyConstraints({ width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: fps } }).catch((e) => console.warn('[камера] не удалось сменить частоту:', e));
