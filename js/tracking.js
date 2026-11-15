@@ -6,9 +6,21 @@ import { MindARThree } from 'mindar-image-three';
 
 export function createTracker(opts) {
   const { container, markerUrl, CF, BETA, MISS, WARM, SYNC, RAW, JUMP, NOGUARD, onFound, onLost, onStall, onFatal,
-          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1,
+          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60,
           PMC = 2, PB = 5, DMC = 0.6, DB = 2, RMC, RB, DC = 1, FOV = 66 } = opts;
 
+  // MindAR просит у камеры только «заднюю камеру» — iPhone тогда снимает 30 кадров/с.
+  // Трекер же успевает ~60 раз в секунду, поэтому просим 60 кадров/с при том же размере кадра:
+  // вдвое меньше сдвиг метки между кадрами и короче выдержка — меньше смаз при резких движениях.
+  if (CAMFPS && navigator.mediaDevices && navigator.mediaDevices.getUserMedia && !navigator.mediaDevices.__fpsPatched) {
+    const md = navigator.mediaDevices, origGUM = md.getUserMedia.bind(md);
+    md.getUserMedia = (c) => {
+      if (c && c.video && typeof c.video === 'object' && !c.video.frameRate)
+        c = { ...c, video: { ...c.video, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: CAMFPS } } };
+      return origGUM(c);
+    };
+    md.__fpsPatched = true;
+  }
   const mindar = new MindARThree({
     container, imageTargetSrc: markerUrl, uiScanning: 'no', uiError: 'no',
     filterMinCF: CF, filterBeta: BETA, missTolerance: MISS, warmupTolerance: WARM,
@@ -107,19 +119,39 @@ export function createTracker(opts) {
     if (n >= 2 && Math.abs(redetects[n - 1].dev - dev) < 3 && recentN > 20) reanchor('перезахваты показывают одно и то же — метку переложили');
   }
   // фиксируем показания гироскопа в момент, когда распознаванию отдают кадр
+  // Камера даёт новый кадр 30–60 раз в секунду, а трекер работает с частотой экрана и часто
+  // обрабатывает тот же кадр повторно. Время кадра узнаём через requestVideoFrameCallback
+  // (а где его нет — по video.currentTime); на повторном кадре время то же, и подсказка трекеру
+  // и оценка скорости его не учитывают, а гироскоп берётся на момент появления кадра.
+  let vfcT = 0, vfcN = 0, vfcVideo = null, lastFrameId = -1, newFrames = 0;
+  function hookVideoFrames() {
+    const v = mindar.video;
+    if (!v || vfcVideo === v || typeof v.requestVideoFrameCallback !== 'function') return;
+    vfcVideo = v;
+    const cb = (now) => { if (vfcVideo !== v) return; vfcT = now; vfcN++; v.requestVideoFrameCallback(cb); };
+    v.requestVideoFrameCallback(cb);
+  }
   function hookFrameImu() {
+    hookVideoFrames();
     const ctrl = mindar.controller, loader = ctrl && ctrl.inputLoader;
     if (!loader || loader.__imuHooked) return;
     const orig = loader.loadInput.bind(loader);
     loader.loadInput = (input) => {
-      if (imu && imu.fresh() && imu.hasAlpha) { imu.worldFromCamera(qWCframe, IMULAG); haveFrameQ = true; } else haveFrameQ = false;
-      frameUpdated = false; frameT = performance.now();
+      const now = performance.now(), useVfc = vfcVideo === mindar.video && vfcN > 0;
+      const id = useVfc ? vfcN : (mindar.video ? mindar.video.currentTime : 0);
+      const isNew = id !== lastFrameId;
+      if (isNew) { lastFrameId = id; newFrames++; frameT = useVfc ? vfcT : now; }
+      // на повторном кадре гироскоп не перечитываем — картинка та же
+      if (isNew) {
+        if (imu && imu.fresh() && imu.hasAlpha) { imu.worldFromCamera(qWCframe, IMULAG + Math.max(0, now - frameT)); haveFrameQ = true; } else haveFrameQ = false;
+      }
+      frameUpdated = false;
       if (PREDICT) predictPose();
       return orig(input);
     };
     loader.__imuHooked = true;
   }
-  const stats = { rejected: 0, updates: 0, fused: 0, imuAngSum: 0, imuN: 0, redetect: 0, coast: 0, pred: 0 };
+  const stats = { rejected: 0, updates: 0, fused: 0, imuAngSum: 0, imuN: 0, redetect: 0, coast: 0, pred: 0, get newFrames() { return newFrames; }, set newFrames(v) { newFrames = v; } };
 
   // ---- Подсказка трекеру: где метка окажется на следующем кадре ----
   // MindAR ищет каждую точку метки только в ±10 пикселях от того места, где она была на прошлом
@@ -262,12 +294,13 @@ export function createTracker(opts) {
       // как метка движется «по комнате» (без учёта поворота телефона) — для продолжения при потере
       uW.copy(cPos).normalize().applyQuaternion(qWC);
       const dt = frameT - tPrevFrame;
-      if (havePrev && dt > 5 && dt < 200) {
+      if (dt === 0) { /* повторный кадр — скорость не трогаем */ }
+      else if (havePrev && dt > 5 && dt < 200) {
         vInst.copy(uW).sub(uPrev).divideScalar(dt);
         vW.lerp(vInst, 0.3);
         if (vW.length() > VMAX) vW.setLength(VMAX);
       } else vW.set(0, 0, 0);
-      uPrev.copy(uW); tPrevFrame = frameT; havePrev = true;
+      if (dt !== 0) { uPrev.copy(uW); tPrevFrame = frameT; havePrev = true; }
       qWCgood.copy(qWC); tGoodFrame = frameT;
     } else havePrev = false;
     coasting = false; coastOk = false;
