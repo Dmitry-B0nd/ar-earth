@@ -6,7 +6,7 @@ import { MindARThree } from 'mindar-image-three';
 
 export function createTracker(opts) {
   const { container, markerUrl, CF, BETA, MISS, WARM, SYNC, RAW, JUMP, NOGUARD, onFound, onLost, onStall, onFatal,
-          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60, JERK = 1, JERKA = 15, JERKW = 400,
+          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60, JERK = 1, JERKA = 10, JERKW = 200,
           PMC = 2, PB = 5, DMC = 0.6, DB = 2, RMC, RB, DC = 1, FOV = 66 } = opts;
 
   // MindAR просит у камеры только «заднюю камеру» — iPhone тогда снимает 30 кадров/с.
