@@ -6,7 +6,7 @@ import { MindARThree } from 'mindar-image-three';
 
 export function createTracker(opts) {
   const { container, markerUrl, CF, BETA, MISS, WARM, SYNC, RAW, JUMP, NOGUARD, onFound, onLost, onStall, onFatal,
-          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60, JERK = 1, JERKA = 10, JERKW = 200, HYBRID = 0, HYAGREE = 6, HYOVR = 0, HYBUDGET = 8, BUILDV = '0', DEDUP = 1, SEARCH = 0, EV = 0,
+          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60, JERK = 1, JERKA = 10, JERKW = 200, HYBRID = 0, HYAGREE = 6, HYOVR = 0, HYBUDGET = 8, BUILDV = '0', DEDUP = 1, SEARCH = 0, EV = 0, LIVE = 0, LIVELAG = 40, PREDSMOOTH = 1,
           PMC = 2, PB = 5, DMC = 0.6, DB = 2, RMC, RB, DC = 1, FOV = 66 } = opts;
 
   // MindAR просит у камеры только «заднюю камеру» — iPhone тогда снимает 30 кадров/с.
@@ -561,7 +561,9 @@ export function createTracker(opts) {
     suspect = 0;
     fusedNow = fused;
     aS = s; accepted = true; lastGood = now; frameUpdated = true;
-    if (SYNC) smoothPose(now);
+    if (havePoseQ) { qWCprev.copy(qWCpose); tPrevPose = tPoseFrame; havePrevQ = true; } else havePrevQ = false;
+    if (fused) { qWCpose.copy(qWC); tPoseFrame = frameT; havePoseQ = true; } else havePoseQ = false;
+    if (SYNC || LIVE) smoothPose(now);
   };
 
   // ---- 2. Сглаживание (One Euro) по отдельности для трёх величин ----
@@ -584,6 +586,16 @@ export function createTracker(opts) {
     } else {
       const dt = Math.min(Math.max((now - last) / 1000, 0.001), 0.1);
       const rmc = RMC ?? (fusedNow ? 1.5 : 1), rb = RB ?? (fusedNow ? 3 : 1);
+      // Прогноз перед сглаживанием: прошлую позу доворачиваем на поворот телефона между кадрами (гироскоп)
+      // и продолжаем движение метки «по комнате». Тогда сглаживается только шум камеры, а не поворот —
+      // сцена не отстаёт, пока телефон поворачивают.
+      if (fusedNow && havePoseQ && havePrevQ && PREDSMOOTH) {
+        const dtf = Math.min(200, Math.max(0, tPoseFrame - tPrevPose));
+        qDp.copy(qWCpose).invert().multiply(qWCprev);                         // камера прошлого кадра → этого
+        uL.copy(sDir).applyQuaternion(qWCprev).addScaledVector(vW, dtf).normalize();
+        sDir.copy(uL).applyQuaternion(qL.copy(qWCpose).invert());
+        sQ.premultiply(qDp);
+      }
       vdF += alpha(DC, dt) * (angle(tDir, sDir) / dt - vdF);                    // рад/с
       vzF += alpha(DC, dt) * (Math.abs(dist - sDist) / sDist / dt - vzF);       // доля расстояния в секунду
       wF  += alpha(DC, dt) * (2 * Math.acos(Math.min(1, Math.abs(sQ.dot(aQ)))) / dt - wF);
@@ -618,6 +630,29 @@ export function createTracker(opts) {
     content.matrix.compose(sPos, sQ, sScale.set(sS, sS, sS));
     markPose(); stats.coast++;
     return (coastOk = since <= COAST_MS);
+  }
+
+  // ---- Живой режим (?live=1): показ развязан с распознаванием ----
+  // Видео с камеры показывается напрямую (всегда плавно), а поза сцены на каждом кадре экрана
+  // пересчитывается по гироскопу «сейчас» от последней позы распознавателя:
+  //   поворот телефона после того кадра — из гироскопа, сдвиг — продолжение движения метки «по комнате».
+  // Если распознаватель задумался на 100 мс, сцену в это время ведёт гироскоп — замирания не видно.
+  // LIVELAG — насколько видео на экране отстаёт от «сейчас» (мс): гироскоп берём на это время раньше.
+  const qWCpose = new THREE.Quaternion(), qNowL = new THREE.Quaternion(), qL = new THREE.Quaternion();
+  const uL = new THREE.Vector3(), pL = new THREE.Vector3();
+  let tPoseFrame = 0, havePoseQ = false, tPrevPose = 0, havePrevQ = false;
+  const qWCprev = new THREE.Quaternion(), qDp = new THREE.Quaternion();
+  function renderLive(now) {
+    if (frozen || !ready || !havePoseQ || !(imu && imu.fresh() && imu.hasAlpha)) return;
+    if (now - lastGood > COAST_MS + FADE_MS) return;
+    imu.worldFromCamera(qNowL, LIVELAG);
+    const d = Math.min(300, Math.max(0, (now - LIVELAG) - tPoseFrame));
+    uL.copy(sDir).applyQuaternion(qWCpose).addScaledVector(vW, d).normalize();   // направление на метку «в комнате»
+    qL.copy(qNowL).invert();
+    pL.copy(uL).applyQuaternion(qL).multiplyScalar(sDist);
+    qL.multiply(qWCpose).multiply(sQ);                                          // поворот: тот же путь через «комнату»
+    content.matrix.compose(pL, qL, sScale.set(sS, sS, sS));
+    markPose();
   }
 
   // ---- 3. Синхронизация видео с трекером ----
@@ -800,7 +835,8 @@ export function createTracker(opts) {
     },
     // вызывать каждый кадр перед отрисовкой
     frame(now) {
-      if (!SYNC) smoothPose(now);
+      if (LIVE) renderLive(now);
+      else if (!SYNC) smoothPose(now);
       // Если распознавание не выдаёт кадров (пауза, запуск после поворота, перезапуск),
       // показываем живое видео, чтобы картинка с камеры не замирала. При заморозке — не трогаем.
       if (SYNC && syncBg && syncCtx && !frozen && now - realProcessed > 150) {
