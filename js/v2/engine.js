@@ -10,15 +10,15 @@
 //  • Задержка кадра и угол обзора камеры подбираются сами, по ходу (без перезагрузки).
 // Наружу — тот же набор, что у первого движка: renderer, scene, camera, content (ширина листа = 1, Z — вверх от листа).
 import * as THREE from 'three';
-import { createSensors } from './sensors.js?v=5.2';
-import { createFusion } from './fusion.js?v=5.2';
+import { createSensors } from './sensors.js?v=5.3';
+import { createFusion } from './fusion.js?v=5.3';
 
-const VER = '5.2';
+const VER = '5.3';
 const CAL_KEY = 'ar-earth-v2-cal-5.1';   // новая версия подбора обзора — старые (смещённые) значения не берём
 
 export function createEngine2(opts) {
   const { container, onFound, onLost, onStall, FOV = 66, CAMFPS = 60, MAXPIX = 76800, BOARDM = 0.18, BG = 'gl',
-    SKIPBLUR = 30, KEEP = 8000, TT0 = 0, BUDGET = 14, DELAY = -1, MAXDELAY = 110, LOCK = 0.7, LAG = null, SMOOTHCLK = false, GRAB = 'pixels', AA = true, AUTOCAL = true, NATIVELAG = 60 } = opts;
+    SKIPBLUR = 30, KEEP = 8000, TT0 = 0, BUDGET = 0, DELAY = -1, MAXDELAY = 140, LOCK = 0.7, LAG = null, SMOOTHCLK = false, GRAB = 'auto', AA = true, AUTOCAL = true, NATIVELAG = 60 } = opts;
 
   // ---------- Рисование ----------
   const renderer = new THREE.WebGLRenderer({ antialias: AA, alpha: BG === 'native', powerPreference: 'default' });
@@ -81,7 +81,11 @@ export function createEngine2(opts) {
   const grabCv = document.createElement('canvas');
   const grabCtx = grabCv.getContext('2d', { willReadFrequently: true });
   const freeBufs = [];
-  let grabMode = GRAB;               // 'pixels' — читаем пиксели здесь; 'bitmap' — картинку отдаём потоку
+  // 'bitmap' — кадр отдаём потоку картинкой (пиксели читает он, основной поток свободен; нужен OffscreenCanvas в потоке),
+  // 'pixels' — читаем пиксели здесь (работает везде, но это 2–8 мс основного потока на кадр)
+  let grabMode = GRAB === 'auto' ? (typeof OffscreenCanvas !== 'undefined' && typeof createImageBitmap === 'function' ? 'bitmap' : 'pixels') : GRAB;
+  let bitmapFails = 0, bitmapProbed = false, lastTagsT = 0;
+  const bitmapSince = performance.now();
   let searchFlip = 0, lastGrabMs = 0;
 
   function startVision() {
@@ -119,8 +123,12 @@ export function createEngine2(opts) {
     if (now - qual.t < 1000 || qual.n < 3) return;
     const avg = qual.ms / qual.n; qual.ms = 0; qual.n = 0; qual.t = now;
     if (TT0) return;
-    if (avg < BUDGET * 0.55 && TARGET_TAG < 44) TARGET_TAG += 3;
-    else if (avg > BUDGET && TARGET_TAG > 18) TARGET_TAG -= 3;
+    // Распознавание идёт в фоновом потоке (другое ядро) — ему можно отдать почти весь промежуток между кадрами.
+    // Шум углов важнее частоты: при показе с задержкой кадры между распознаваниями сглаживаются, а шумные — дрожат.
+    const frameMs = Math.max(33, clk.T || 33);
+    const budget = BUDGET > 0 ? BUDGET : frameMs * 0.7;
+    if (avg < budget * 0.6 && TARGET_TAG < 48) TARGET_TAG = Math.min(48, TARGET_TAG + 3);
+    else if (avg > budget && TARGET_TAG > 18) TARGET_TAG -= 3;
   }
   function planRoi(tf) {
     let sx = 0, sy = 0, sw = vw, sh = vh, scale;
@@ -143,7 +151,7 @@ export function createEngine2(opts) {
     }
     scale = Math.min(scale, 1);
     let dw = Math.max(32, Math.round(sw * scale)), dh = Math.max(32, Math.round(sh * scale));
-    const cap = pc ? Math.min(MAXPIX * (TARGET_TAG / 22) ** 2, 230000) : MAXPIX * 2.25;
+    const cap = pc ? Math.min(MAXPIX * (TARGET_TAG / 22) ** 2, 260000) : MAXPIX * 2.25;
     if (dw * dh > cap) { const k = Math.sqrt(cap / (dw * dh)); dw = Math.max(32, Math.round(dw * k)); dh = Math.max(32, Math.round(dh * k)); }
     return { sx, sy, sw, sh, dw, dh };
   }
@@ -164,12 +172,13 @@ export function createEngine2(opts) {
     busy = true; busySince = performance.now();
     sentTa.set(id, vf.last);
     const t0 = performance.now();
-    if (grabMode === 'bitmap' && worker) {
+    if (grabMode === 'bitmap' && worker && workerOk) {
       createImageBitmap(video, r.sx, r.sy, r.sw, r.sh, { resizeWidth: r.dw, resizeHeight: r.dh, resizeQuality: 'low' }).then((bmp) => {
-        lastGrabMs = 0; sec.grabMs += performance.now() - t0;
+        lastGrabMs = 0; sec.grabMs += callMs;
         worker.postMessage({ type: 'frame', id, tFrame: tf, w: r.dw, h: r.dh, map, bitmap: bmp }, [bmp]);
         sec.sent++;
       }).catch((e) => { console.warn('[движок 2] картинка кадра не получилась — читаю пиксели сам:', e); grabMode = 'pixels'; busy = false; });
+      const callMs = performance.now() - t0;
       return;
     }
     if (grabCv.width !== r.dw || grabCv.height !== r.dh) { grabCv.width = r.dw; grabCv.height = r.dh; }
@@ -201,23 +210,37 @@ export function createEngine2(opts) {
     if (ta) {
       const L = performance.now() - ta;
       visLat += (L - visLat) * (L > visLat ? 0.3 : 0.05);         // вверх быстро, вниз медленно
-      if (DELAY < 0) delayMs = Math.min(MAXDELAY, visLat + 6);
+      // задержку показа меняем редко и ступеньками: если она «гуляет» от кадра к кадру, кадры идут неровно
+      if (DELAY < 0) {
+        const target = Math.min(MAXDELAY, visLat + 8);
+        if (target > delayMs + 4 || target < delayMs - 12) delayMs += (target - delayMs) * 0.5;
+      }
     }
-    if (m.type === 'err') { sec.fails++; return; }
+    if (m.type === 'err') {
+      sec.fails++;
+      if (grabMode === 'bitmap' && ++bitmapFails >= 2) { grabMode = 'pixels'; console.warn('[движок 2] поток не читает картинку кадра — читаю пиксели сам:', m.msg); }
+      return;
+    }
     const now = performance.now();
     visionLoops++; sec.res++;
     sec.procMs += m.ms; sec.readMs += m.readMs || 0;
-    adaptQuality(m.ms + lastGrabMs);
+    adaptQuality(worker && workerOk ? m.ms : m.ms + lastGrabMs);
     if (gaps.lastProc) gaps.proc = Math.max(gaps.proc, now - gaps.lastProc);
     gaps.lastProc = now;
     sec.tags = m.tags; sec.side = m.side; sec.err = m.err || 0;
+    if (m.tags > 0) lastTagsT = now;
+    if (grabMode === 'bitmap' && GRAB === 'auto' && !bitmapProbed && now - Math.max(lastTagsT, bitmapSince) > 5000) {
+      // картинкой ничего не находится 5 с — возможно, браузер отдаёт пустую картинку: пробуем пикселями
+      bitmapProbed = true; grabMode = 'pixels';
+      console.warn('[движок 2] картинкой метки не находятся — пробую читать пиксели');
+    }
     if (frozen || paused || !m.n || m.n < 4) return;
     // первое нахождение (и после долгой потери) — минимум по двум меткам: одну метку легче спутать с узором
     const lost = !fusion.st.init || now - fusion.st.lastMeas > 1500;
     if (lost && m.tags < 2) return;
     if (lost && fusion.st.init) fusion.reacquire();
     flushMotion();
-    const r = fusion.measure({ tFrame: m.tFrame, pts: m.pts, n: m.n, H: m.H });
+    const r = fusion.measure({ tFrame: m.tFrame, pts: m.pts, n: m.n, H: m.H, err: m.n >= 8 ? m.err : null });
     if (r.ok) { stats.updates++; sec.found++; } else stats.rejected++;
     if (AUTOCAL) fusion.calibStep(now);
     saveCal(now);
@@ -415,6 +438,7 @@ export function createEngine2(opts) {
     const fname = { 'acc+': 'с акселерометром', 'acc-': 'с акселерометром (обр. знак)', cv: 'по скорости', hold: 'на месте' }[F.filt] || F.filt;
     const per = (v) => (v / dt).toFixed(0);
     // средний «скачок» поправки за секунду, пиксели видео (до плавного растворения) — мерило дрожи от распознавания
+    const lockTxt = F.diag.lockW != null ? `  привязка ${Math.round(F.diag.lockW * 100)}% (шум углов ${F.diag.sigC.toFixed(1)} px)` : '';
     const corr = F.diag.corrN ? (F.diag.corr / F.diag.corrN).toFixed(1) + ' px' : '—';
     F.diag.corr = 0; F.diag.corrN = 0;
     const ext = sd.extra || 0; sd.extra = 0;
@@ -422,9 +446,9 @@ export function createEngine2(opts) {
     return `движок 2  камера ${vw}×${vh} ${fr ? Math.round(fr) + ' к/с' : ''}, новых ${per(d.frames)}/с (время ${vf.mode})\n` +
       `показ с задержкой ${delayMs.toFixed(0)} мс${DELAY < 0 ? ' (авто)' : ''}\n` +
       `поиск ${per(d.res)}/с: ${d.res ? (d.procMs / d.res).toFixed(1) : '—'} мс ${worker && workerOk ? 'в фоне' : 'в основном потоке'}` +
-      ` + захват ${d.sent ? (d.grabMs / d.sent).toFixed(1) : '—'} мс\n` +
+      ` + захват ${d.sent ? (d.grabMs / d.sent).toFixed(1) : '—'} мс (${grabMode === 'bitmap' ? 'картинкой' : 'пикселями'})\n` +
       `  ${sec.roi} (чёткость ${TARGET_TAG})  ${tags}  нашёл ${per(d.found)}/с  смаз: пропуск ${d.blurSkip} отказ ${F.diag.blurRej}${d.fails ? '  сбоев ' + d.fails : ''}\n` +
-      `сдвиг: ${fname}  отсев ${F.diag.rej}  сбросов ${F.resets}  рассогл. ${F.diag.inconsist}  поправки ${corr}\n` +
+      `сдвиг: ${fname}  отсев ${F.diag.rej}  сбросов ${F.resets}  рассогл. ${F.diag.inconsist}  поправки ${corr}${lockTxt}\n` +
       `  промахи ${Object.entries(F.diag.nis).map(([k, v]) => k + ' ' + v.toFixed(1)).join('  ')}\n` +
       `калибр.: задержка ${fusion.lag.toFixed(0)} мс  обзор ${fusion.fov.toFixed(1)}°  (подборов ${c.lagRuns}/${c.fRuns}${c.spread != null ? ', разброс ' + c.spread.toFixed(2) + '°' : ''})\n` +
       `датчики (${sensors.source}): ориент. ${sd.rel}/${sd.relNull} комп. ${sd.abs} движ. ${sd.mot} уск. ${sd.acc}  знак g ${fusion.gSign > 0 ? '+' : fusion.gSign < 0 ? '−' : '?'}${sd.late ? '  опозд. ' + sd.late : ''}  запаздывание до ${ext.toFixed(0)} мс\n` +

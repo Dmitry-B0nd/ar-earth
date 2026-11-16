@@ -502,7 +502,13 @@ export function createFusion(opts = {}) {
     lastZ = z; lastZt = tms; lastZblur = blurPx;
     // измерение «этого самого кадра» — для показа с задержкой: кадр, у которого есть своё распознавание,
     // ставим по нему (сцена жёстко привязана к картинке — без дрожи от неточного прогноза)
-    meas.push({ tf: d.tFrame, z: z.slice(), sl }); if (meas.length > 16) meas.shift();
+    // доля привязки — от точности распознавания: точное (сильный телефон, ошибка углов ≲ 0,7 px) — почти целиком,
+    // шумное (слабый телефон, грубый участок) — не привязываем: иначе шум углов прямо передаётся Земле
+    const sigC = d.err != null ? Math.max(0.3, 1.3 * d.err) : sig;   // шум углов по подгонке гомографии этого кадра (смаз в ней уже виден)
+    st.diag.sigC = sigC;
+    const lockW = o.lock * Math.max(0, Math.min(1, (1.8 - sigC) / 1.2));
+    st.diag.lockW = lockW;
+    meas.push({ tf: d.tFrame, z: z.slice(), sl, w: lockW }); if (meas.length > 16) meas.shift();
     for (const k in filters) st.diag.nis[k] = filters[k].perr;
     // плавность: разница между старым и новым видом уходит за blendMs
     if (before && st.init && !reset) {
@@ -570,7 +576,7 @@ export function createFusion(opts = {}) {
             lastLockTf = m.tf;
             st.diag.corr += Math.hypot(m.z[0] - outP.x, m.z[1] - outP.y, m.z[2] - outP.z) / Math.max(0.3, outP.length()) * st.f; st.diag.corrN++;
           }
-          outP.x += o.lock * (m.z[0] - outP.x); outP.y += o.lock * (m.z[1] - outP.y); outP.z += o.lock * (m.z[2] - outP.z); break; }
+          outP.x += m.w * (m.z[0] - outP.x); outP.y += m.w * (m.z[1] - outP.y); outP.z += m.w * (m.z[2] - outP.z); break; }
         if (m.tf < tFrame - 10) break;
       }
     }
@@ -596,7 +602,7 @@ export function createFusion(opts = {}) {
   function calibAdd(d, rate) {
     C.samples.push({ t: d.tFrame, H: Array.from(d.H), rate });
     const cut = nowf() - 8000;
-    while (C.samples.length && (C.samples[0].t < cut || C.samples.length > 80)) C.samples.shift();
+    while (C.samples.length && (C.samples[0].t < cut || C.samples.length > 60)) C.samples.shift();
   }
   const qa = new THREE.Quaternion(), qb = new THREE.Quaternion();
   // разброс поворота листа в комнате: cams[i] — поворот камеры, cms[i] — поворот листа относительно камеры
@@ -675,7 +681,8 @@ export function createFusion(opts = {}) {
       const cams = camsAt(st.lag);
       const cur = gravErr(cams, cmsAt(st.f));
       let best = 1, bj = cur;
-      for (let k = 0.85; k <= 1.151; k += 0.01) { const j = gravErr(cams, cmsAt(st.f * k)); if (j !== null && j < bj) { bj = j; best = k; } }
+      for (let k = 0.85; k <= 1.151; k += 0.03) { const j = gravErr(cams, cmsAt(st.f * k)); if (j !== null && j < bj) { bj = j; best = k; } }
+      for (let k = best - 0.02; k <= best + 0.021; k += 0.01) { const j = gravErr(cams, cmsAt(st.f * k)); if (j !== null && j < bj) { bj = j; best = k; } }
       C.fJ = bj; C.spread = cur; C.fMode = 'гравит.';
       const dir = cur !== null && cur - bj > 0.3 && Math.abs(best - 1) > 0.008 ? Math.sign(best - 1) : 0;
       if (dir && dir === C.fDir) {

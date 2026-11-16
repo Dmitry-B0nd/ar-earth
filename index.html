@@ -218,14 +218,14 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=5.2';
-import { createEngine2 } from './js/v2/engine.js?v=5.2';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=5.2';
-import { createImu } from './js/imu.js?v=5.2';
-import { createViewer3D } from './js/viewer3d.js?v=5.2';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=5.2';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=5.2';
-const BUILD = '5.2';
+import { createTracker } from './js/tracking.js?v=5.3';
+import { createEngine2 } from './js/v2/engine.js?v=5.3';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=5.3';
+import { createImu } from './js/imu.js?v=5.3';
+import { createViewer3D } from './js/viewer3d.js?v=5.3';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=5.3';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=5.3';
+const BUILD = '5.3';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -290,7 +290,7 @@ const ENGINE = q.get('engine') === '1' ? 1 : 2;
 // параметры движка 2 (для опытов): bg=native — видео под сценой (а не текстурой), grab=bitmap — кадр в поток картинкой,
 // maxpix — сколько пикселей участка распознавать, lag — задержка кадра, мс (по умолчанию подбирается сама), fov — угол обзора
 const E2 = {
-  BG: q.get('bg') === 'native' ? 'native' : 'gl', GRAB: q.get('grab') === 'bitmap' ? 'bitmap' : 'pixels',
+  BG: q.get('bg') === 'native' ? 'native' : 'gl', GRAB: ['bitmap', 'pixels'].includes(q.get('grab')) ? q.get('grab') : 'auto',
   MAXPIX: num('maxpix', 76800), LAG: q.has('lag') ? num('lag') : null, FOV: q.has('fov') ? num('fov') : undefined,
   CAMFPS: num('camfps', 60), SKIPBLUR: num('skipblur', 30), KEEP: num('keep', 8000), BOARDM: num('boardm', 0.18),
   AUTOCAL: q.get('autocal') !== '0', AA: q.get('aa') !== '0',
