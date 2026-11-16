@@ -11,14 +11,14 @@
 import { AR, CV } from './vendor/aruco.mjs';
 import jsfeat from './vendor/jsfeat.mjs';
 
-// 2×2 — метки крупнее (8 см, клетка 13,5 мм): устойчивее к смазу на слабых телефонах (по умолчанию);
-// 3×3 — метки мельче (5 см), но больше углов (?board=3). Метки 0–3 и 0–8: листы разные — печатать нужный.
+// 3×3 — метки 5 см (по умолчанию): вблизи в кадре остаётся несколько меток;
+// 2×2 — метки 8 см (?board=2): на тестах лучше переносили смаз, но на телефоне вблизи терялись. Листы разные.
 export const BOARDS = {
   2: { cols: 2, rows: 2, s: 0.45, g: 0.10, firstId: 0 },
   3: { cols: 3, rows: 3, s: 0.28, g: 0.08, firstId: 0 },
 };
-export let BOARD = BOARDS[2];
-export function setBoard(n) { BOARD = BOARDS[n] || BOARDS[2]; return BOARD; }
+export let BOARD = BOARDS[3];
+export function setBoard(n) { BOARD = BOARDS[n] || BOARDS[3]; return BOARD; }
 
 // углы метки id на листе (TL, TR, BR, BL) в долях ширины листа, или null, если такой метки на листе нет
 export function boardCorners(id) {
@@ -143,6 +143,10 @@ export function createFiducial() {
         e += Math.hypot((h[0] * from[i].x + h[1] * from[i].y + h[2]) / z - to[i].x, (h[3] * from[i].x + h[4] * from[i].y + h[5]) / z - to[i].y);
       }
       stats.err = e / n;
+      // центр видимых углов на метке (в координатах метки MindAR) — вокруг него поза определена надёжнее всего
+      let cx = 0, cy = 0;
+      for (let i = 0; i < n; i++) { cx += from[i].x; cy += from[i].y; }
+      stats.cx = cx / n; stats.cy = cy / n;
       stats.ms = performance.now() - t0;
       return h;
     },

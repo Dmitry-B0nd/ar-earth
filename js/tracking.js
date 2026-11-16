@@ -6,7 +6,7 @@ import { MindARThree } from 'mindar-image-three';
 
 export function createTracker(opts) {
   const { container, markerUrl, CF, BETA, MISS, WARM, SYNC, RAW, JUMP, NOGUARD, onFound, onLost, onStall, onFatal,
-          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60, JERK = 1, JERKA = 10, JERKW = 200, HYBRID = 0, HYAGREE = 6, HYOVR = 0, HYBUDGET = 8, BUILDV = '0', DEDUP = 1, SEARCH = 0, EV = 0, LIVE = 0, LIVELAG = 40, PREDSMOOTH = 1, PREDV = 0, MARKER = 'image', BOARDN = 2,
+          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60, JERK = 1, JERKA = 10, JERKW = 200, HYBRID = 0, HYAGREE = 6, HYOVR = 0, HYBUDGET = 8, BUILDV = '0', DEDUP = 1, SEARCH = 0, EV = 0, LIVE = 0, LIVELAG = 40, PREDSMOOTH = 1, PREDV = 0, MARKER = 'image', BOARDN = 3, ARCEN = 1,
           PMC = 2, PB = 5, DMC = 0.6, DB = 2, RMC, RB, DC = 1, FOV = 66 } = opts;
 
   // MindAR просит у камеры только «заднюю камеру» — iPhone тогда снимает 30 кадров/с.
@@ -392,6 +392,7 @@ export function createTracker(opts) {
   // поза на кадре — результат распознавания листа (гомография по всем видимым углам → поза).
   // Всё остальное (гироскоп, сглаживание, удержание, синхронизация) работает как обычно.
   const ARUCO = MARKER === 'aruco';
+  const qRawC = new THREE.Quaternion(), qTmpC = new THREE.Quaternion(), pCen = new THREE.Vector3(), offC = new THREE.Vector3();
   let fid = null, arucoM = null;
   if (ARUCO) import('./fiducial.js?v=' + BUILDV).then((m) => { m.setBoard(BOARDN); fid = m.createFiducial(); console.log('[метка] режим: лист квадратных меток ' + BOARDN + '×' + BOARDN); })
     .catch((e) => console.error('[метка] распознаватель не загрузился:', e));
@@ -562,8 +563,20 @@ export function createTracker(opts) {
 
       // поворот сцены — из гироскопа и усреднённой ориентации метки; положение остаётся от камеры
       if (dev <= BIG) {
+        qRawC.copy(cQ);
         cQ.copy(qWC).invert().multiply(qMW);
         fused = true; stats.fused++;
+        // Лист меток: вблизи видны 1–2 метки сбоку, и центр листа (где висит Земля) достраивается «рычагом»,
+        // который раскачивает любая неточность наклона. Берём из камеры только положение видимых углов,
+        // а до центра листа доходим по точному повороту из гироскопа.
+        if (ARUCO && ARCEN && fid && arucoM && fid.stats.cx !== undefined) {
+          const M = arucoM, X = fid.stats.cx, Y = fid.stats.cy;
+          // видимый центр углов в камере three.js (оси MindAR: y вниз, z вперёд → у нас y вверх, z назад)
+          pCen.set(M[0][0] * X + M[0][1] * Y + M[0][3], -(M[1][0] * X + M[1][1] * Y + M[1][3]), -(M[2][0] * X + M[2][1] * Y + M[2][3]));
+          // смещение «центр листа → видимый центр» в осях сцены по сырой позе, затем — по точному повороту
+          offC.copy(pCen).sub(cPos).applyQuaternion(qTmpC.copy(qRawC).invert()).applyQuaternion(cQ);
+          cPos.copy(pCen).sub(offC);
+        }
       }
     }
     else if (USE_IMU && imu && haveFrameUp) {
@@ -648,8 +661,11 @@ export function createTracker(opts) {
       vdF += alpha(DC, dt) * (angle(tDir, sDir) / dt - vdF);                    // рад/с
       vzF += alpha(DC, dt) * (Math.abs(dist - sDist) / sDist / dt - vzF);       // доля расстояния в секунду
       wF  += alpha(DC, dt) * (2 * Math.acos(Math.min(1, Math.abs(sQ.dot(aQ)))) / dt - wF);
-      sDir.lerp(tDir, alpha(PMC + PB * vdF, dt)).normalize();
-      const az = alpha(DMC + DB * vzF, dt);
+      // лист меток: много меток — поза точная, сглаживаем слабо; 1–2 метки — сильнее (иначе вблизи трясётся)
+      const few = ARUCO && fid && fid.stats.markers <= 2;
+      const pmc = few ? Math.min(PMC, 3) : PMC, pb = few ? Math.min(PB, 6) : PB, dmc = few ? Math.min(DMC, 1.2) : DMC, db = few ? Math.min(DB, 3) : DB;
+      sDir.lerp(tDir, alpha(pmc + pb * vdF, dt)).normalize();
+      const az = alpha(dmc + db * vzF, dt);
       sDist += az * (dist - sDist);
       sS += az * (aS - sS);
       sQ.slerp(aQ, alpha(rmc + rb * wF, dt));
