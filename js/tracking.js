@@ -6,7 +6,7 @@ import { MindARThree } from 'mindar-image-three';
 
 export function createTracker(opts) {
   const { container, markerUrl, CF, BETA, MISS, WARM, SYNC, RAW, JUMP, NOGUARD, onFound, onLost, onStall, onFatal,
-          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60, JERK = 1, JERKA = 10, JERKW = 200, HYBRID = 0, HYAGREE = 6, HYOVR = 0, HYBUDGET = 8, BUILDV = '0', DEDUP = 1, SEARCH = 0, EV = 0, LIVE = 0, LIVELAG = 40, PREDSMOOTH = 1, PREDV = 0,
+          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60, JERK = 1, JERKA = 10, JERKW = 200, HYBRID = 0, HYAGREE = 6, HYOVR = 0, HYBUDGET = 8, BUILDV = '0', DEDUP = 1, SEARCH = 0, EV = 0, LIVE = 0, LIVELAG = 40, PREDSMOOTH = 1, PREDV = 0, MARKER = 'image',
           PMC = 2, PB = 5, DMC = 0.6, DB = 2, RMC, RB, DC = 1, FOV = 66 } = opts;
 
   // MindAR просит у камеры только «заднюю камеру» — iPhone тогда снимает 30 кадров/с.
@@ -177,6 +177,12 @@ export function createTracker(opts) {
     const st = trk && trk.getSettings ? trk.getSettings() : {};
     camFps = st.frameRate || 0;
     setSearch(SEARCH || (camFps && camFps <= 40 ? 15 : 10));
+    if (ARUCO) {
+      // лист квадратных меток: и «поиск», и «слежение» — это просто результат распознавания этого кадра
+      const copyM = () => arucoM.map((r) => r.slice());
+      ctrl._detectAndMatch = () => Promise.resolve(arucoM ? { targetIndex: 0, modelViewTransform: copyM() } : { targetIndex: -1 });
+      ctrl._trackAndUpdate = () => Promise.resolve(arucoM ? copyM() : null);
+    }
     if (DEDUP) {
       const tu = ctrl._trackAndUpdate.bind(ctrl), dm = ctrl._detectAndMatch.bind(ctrl);
       ctrl._trackAndUpdate = (inp, M, i) => (curDup ? Promise.resolve(M) : tu(inp, M, i));            // тот же кадр — та же поза
@@ -228,9 +234,10 @@ export function createTracker(opts) {
       // MindAR сначала рисует кадр на свой холст; поиск метки начнётся уже после возврата отсюда,
       // поэтому подсказку (позу потока) можно поставить и после — а кадр взять готовым с его холста
       const res = orig(input);
+      if (ARUCO && isNew) fidFrame(loader.context && loader.context.canvas);
       if (isNew && hy && hyTurn()) hySafe(() => hybridFrame(loader.context && loader.context.canvas));
       else hyValid = false;
-      if (PREDICT && !hyValid) predictPose();
+      if (PREDICT && !hyValid && !ARUCO) predictPose();
       return res;
     };
     loader.__imuHooked = true;
@@ -378,6 +385,25 @@ export function createTracker(opts) {
       const [mw, mh] = markerDims();
       if (hy.seed(hySeedFrom, mw, mh)) hyStats.seedT = now;
     }
+  }
+
+  // ---- Лист квадратных меток (?marker=aruco) вместо картинки ----
+  // Распознаватель меток (js/fiducial.js) подгружается только в этом режиме. Поиск MindAR подменяется:
+  // поза на кадре — результат распознавания листа (гомография по всем видимым углам → поза).
+  // Всё остальное (гироскоп, сглаживание, удержание, синхронизация) работает как обычно.
+  const ARUCO = MARKER === 'aruco';
+  let fid = null, arucoM = null;
+  if (ARUCO) import('./fiducial.js?v=' + BUILDV).then((m) => { fid = m.createFiducial(); console.log('[метка] режим: лист квадратных меток'); })
+    .catch((e) => console.error('[метка] распознаватель не загрузился:', e));
+  function fidFrame(src) {
+    arucoM = null;
+    if (!fid || !src || frozen || videoRotated() || !mindar.controller.projectionTransform) return;
+    try {
+      if (!fid.grab(src)) return;
+      const [mw, mh] = markerDims();
+      const h = fid.detect(mw, mh);
+      if (h) arucoM = HtoM(h);
+    } catch (e) { console.error('[метка] ошибка распознавания:', e); arucoM = null; }
   }
 
   // ---- Рывок ----
@@ -956,6 +982,7 @@ export function createTracker(opts) {
     },
     get frozen() { return frozen; },
     get loops() { return loopRuns; },
+    get fiducial() { return fid ? { on: true, ...fid.stats, found: !!arucoM } : { on: ARUCO, loading: ARUCO }; },
     get camMode() { return { fps: camFps, search: searchR, ev: evSet }; },
     // самые длинные паузы с прошлого вызова, мс
     takeGaps() { const g = { pose: gaps.pose, proc: gaps.proc }; gaps.pose = gaps.proc = 0; return g; },
