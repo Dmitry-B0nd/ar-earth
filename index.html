@@ -218,13 +218,14 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=4.29';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=4.29';
-import { createImu } from './js/imu.js?v=4.29';
-import { createViewer3D } from './js/viewer3d.js?v=4.29';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=4.29';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.29';
-const BUILD = '4.29';
+import { createTracker } from './js/tracking.js?v=5.0';
+import { createEngine2 } from './js/v2/engine.js?v=5.0';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=5.0';
+import { createImu } from './js/imu.js?v=5.0';
+import { createViewer3D } from './js/viewer3d.js?v=5.0';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=5.0';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=5.0';
+const BUILD = '5.0';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -283,6 +284,18 @@ const P = {
   DEBUG: q.get('debug') === '1',       // рамка и оси метки
 };
 const MARKER_FILE = './marker-bw.mind';
+// Движок трекинга: 2 (по умолчанию) — новый: гироскоп + акселерометр + лист квадратных меток (marker/aruco-A4.pdf),
+// распознавание в фоновом потоке. ?engine=1 — прежний (MindAR, картинка-метка).
+const ENGINE = q.get('engine') === '1' ? 1 : 2;
+// параметры движка 2 (для опытов): bg=native — видео под сценой (а не текстурой), grab=bitmap — кадр в поток картинкой,
+// maxpix — сколько пикселей участка распознавать, lag — задержка кадра, мс (по умолчанию подбирается сама), fov — угол обзора
+const E2 = {
+  BG: q.get('bg') === 'native' ? 'native' : 'gl', GRAB: q.get('grab') === 'bitmap' ? 'bitmap' : 'pixels',
+  MAXPIX: num('maxpix', 76800), LAG: q.has('lag') ? num('lag') : null, FOV: q.has('fov') ? num('fov') : undefined,
+  CAMFPS: num('camfps', 60), SKIPBLUR: num('skipblur', 30), KEEP: num('keep', 8000), BOARDM: num('boardm', 0.18),
+  AUTOCAL: q.get('autocal') !== '0', AA: q.get('aa') !== '0',
+};
+if (ENGINE === 2) document.getElementById('hint').querySelector('img').src = 'img/marker-hint-v2.png';
 
 const overlay = document.getElementById('overlay');
 const msg = document.getElementById('msg');
@@ -358,7 +371,7 @@ async function start(mode) {
   (AR ? btn : btn3d).textContent = 'Загрузка…';
 
   let markerUrl = null, textures;
-  if (AR) try {
+  if (AR && ENGINE === 1) try {
     markerUrl = await markerPromise;
   } catch (e) {
     console.error('Ошибка загрузки файла метки:', e);
@@ -387,7 +400,12 @@ async function start(mode) {
   const imuOk = await imuPermission;
   if (AR) console.log('[датчики]', P.USE_IMU ? (imuOk ? 'доступ есть' : 'доступа нет — работаем только по камере') : 'выключены');
   const container = document.getElementById('container');
-  const tracker = AR ? createTracker({
+  const tracker = !AR ? createViewer3D({ container }) : ENGINE === 2 ? createEngine2({
+    container, ...E2,
+    onFound: () => { status.textContent = 'Метка найдена'; status.classList.add('found'); },
+    onLost:  () => { status.textContent = 'Ищу метку…';   status.classList.remove('found'); },
+    onStall: () => { document.getElementById('stall').style.display = 'flex'; },
+  }) : createTracker({
     container, markerUrl, ...P, imu: imuOk ? imu : null,
     onFound: () => { status.textContent = 'Метка найдена'; status.classList.add('found'); },
     onLost:  () => { status.textContent = 'Ищу метку…';   status.classList.remove('found'); },
@@ -397,8 +415,9 @@ async function start(mode) {
       try { sessionStorage.setItem('ar-resume', why); } catch (e) {}
       setTimeout(() => location.reload(), 300);
     },
-  }) : createViewer3D({ container });
+  });
   const { renderer, scene, camera, content } = tracker;
+  console.log('[трекинг]', AR ? (ENGINE === 2 ? 'движок 2 (гироскоп + лист меток)' : 'движок 1 (MindAR)') : 'без камеры');
   if (window.DEV) window.__tracker = tracker;      // для отладки из консоли
 
   // ---------- Сцена ----------
@@ -737,6 +756,11 @@ async function start(mode) {
     return `гибрид: точек ${h.pts}  ${h.ms.toFixed(1)} мс (кадр ${h.grab.toFixed(1)})${lv}\n  свой ${h.drive}  вернул ${h.revive}  посев ${h.seeds}  расх. ${h.diff.toFixed(1)} px\n`;
   };
   if (window.DEV) setInterval(() => {
+    if (AR && ENGINE === 2) {
+      paramsBox.textContent = `сборка ${BUILD}\n` + `время UTC ${fmt(simDate)}  ×${view.speed}\n` + tracker.devText() +
+        `режим: ${lite.on ? 'лёгкий (' + lite.why + ')' : 'обычный'}  рисование ${lite.fps}\n` + gapLine();
+      return;
+    }
     paramsBox.textContent = `сборка ${BUILD}\n` +
       `время UTC ${fmt(simDate)}  ×${view.speed}\n` +
       (AR ? camLine() + `трекер ${tracker.stats.updates} Гц  отсев ${tracker.stats.rejected}\n` : '') +
@@ -791,12 +815,15 @@ async function start(mode) {
   if (POTATO === '1') setLite(true, 'вручную');
   setInterval(() => {
     const fps = renders; renders = 0;
+    // движок 2 рисует только новые кадры камеры: «медленно» — это если не успеваем даже их
+    const camN = AR && ENGINE === 2 ? tracker.frames - (lite.frames || 0) : 0; if (AR && ENGINE === 2) lite.frames = tracker.frames;
     const loops = AR ? tracker.loops - lite.loops : 0; if (AR) lite.loops = tracker.loops;
     lite.fps = fps; lite.loopRate = loops;
     if (lite.on || POTATO === '0' || document.hidden || performance.now() - lite.since < 3000) return;
     if (AR && (tracker.frozen || tracker.restarting)) { lite.bad = 0; return; }
-    const slowTrack = AR && tracker.shown && loops < 22;
-    if (fps < 40 || slowTrack) lite.bad++; else lite.bad = 0;
+    const slowTrack = AR && ENGINE === 1 && tracker.shown && loops < 22;   // движку 2 медленное распознавание не мешает
+    const slowDraw = AR && ENGINE === 2 ? fps < Math.min(40, camN * 0.8) : fps < 40;
+    if (slowDraw || slowTrack) lite.bad++; else lite.bad = 0;
     if (lite.bad >= 3) setLite(true, `авто: рисование ${fps} к/с, трекер ${AR ? loops : '—'} Гц`);
   }, 1000);
 
@@ -812,7 +839,8 @@ async function start(mode) {
     }
     lastEarthT = now;
     // в лёгком режиме рисуем не чаще ~30 раз в секунду (время видеокарты нужнее трекеру)
-    const skipRender = lite.on && now - lastRender < 30;
+    // движок 2: рисуем, только когда пришёл новый кадр камеры (сцена привязана к кадру) — вдвое меньше работы при 30 к/с
+    const skipRender = (lite.on && now - lastRender < 30) || (AR && ENGINE === 2 && !tracker.needRender);
     if (!skipRender) {
       earth.update(simDate);
       poi.update(now / 1000, camera);
