@@ -218,13 +218,13 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=4.26';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=4.26';
-import { createImu } from './js/imu.js?v=4.26';
-import { createViewer3D } from './js/viewer3d.js?v=4.26';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=4.26';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.26';
-const BUILD = '4.26';
+import { createTracker } from './js/tracking.js?v=4.27';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=4.27';
+import { createImu } from './js/imu.js?v=4.27';
+import { createViewer3D } from './js/viewer3d.js?v=4.27';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=4.27';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.27';
+const BUILD = '4.27';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -234,6 +234,8 @@ console.log('[0] Библиотеки загружены через', sec());
 // ---------- Параметры из адреса страницы (например ?speed=1200&r=0.35) ----------
 const q = new URLSearchParams(location.search);
 const num = (k, d) => parseFloat(q.get(k) ?? d);
+// калибровка «камера ↔ гироскоп», сохранённая на этом телефоне (угол обзора, задержка кадра); ?calib=0 — не применять
+const CAL = (() => { try { return q.get('calib') === '0' ? {} : (JSON.parse(localStorage.getItem('ar-earth-cal') || '{}') || {}); } catch (e) { return {}; } })();
 const P = {
   // трекинг (подобрано в День 1)
   CF: num('cf', 1), BETA: num('beta', 0),
@@ -245,7 +247,7 @@ const P = {
   // датчики телефона: наклон метки берём из гироскопа (метка лежит на столе)
   // поворот сцены — из гироскопа, камера медленно подправляет (kmw); imulag — задержка кадра камеры, мс
   USE_IMU: q.get('imu') !== '0' && q.get('mount') !== 'wall', TOL: num('tol', 20),
-  IMULAG: num('imulag', 0), KMW: num('kmw', 0.03), COAST: num('coast', 500),
+  IMULAG: num('imulag', CAL.lag ?? 0), KMW: num('kmw', 0.03), COAST: num('coast', 500),
   // подсказка трекеру, где метка будет на следующем кадре (0 — выключить)
   PREDICT: num('predict', 1),
   // частота кадров, которую просим у камеры (0 — как решит браузер, обычно 30)
@@ -263,7 +265,8 @@ const P = {
   HYOVR: num('hyovr', 0),
   JERK: num('jerk', 1), JERKA: num('jerka', 10), JERKW: num('jerkw', 200),
   // угол обзора камеры телефона по длинной стороне кадра, градусы (0 = как в MindAR по умолчанию, 45°)
-  FOV: num('fov', 66),
+  FOV: num('fov', CAL.fov ?? 66), CALIB: num('calib', 1),
+  onCalib: (c) => { try { localStorage.setItem('ar-earth-cal', JSON.stringify({ ...c, at: new Date().toISOString() })); } catch (e) {} },
   RAW: q.get('raw') === '1', JUMP: num('jump', 25), NOGUARD: q.get('noguard') === '1',
   MISS: parseInt(q.get('miss') ?? '2'), WARM: parseInt(q.get('warm') ?? '2'), SYNC: q.get('sync') !== '0' && q.get('live') !== '1',
   // живой режим: видео напрямую, поза сцены каждый кадр по гироскопу (live=1); livelag — задержка видео, мс
@@ -706,7 +709,15 @@ async function start(mode) {
     const cm = tracker.camMode;
     return `камера ${v ? v.videoWidth + '×' + v.videoHeight : '—'}  ${fr ? Math.round(fr) + ' к/с' : ''}  новых ${tracker.stats.newFrames}\n` +
       `поиск ±${cm.search}  повторов ${tracker.stats.dups}${cm.ev !== null ? '  эксп. ' + cm.ev : ''}\n` +
-      `режим: ${lite.on ? 'лёгкий (' + lite.why + ')' : 'обычный'}  рисование ${lite.fps}\n` + gapLine() + hyLine();
+      `режим: ${lite.on ? 'лёгкий (' + lite.why + ')' : 'обычный'}  рисование ${lite.fps}\n` + gapLine() + calLine() + hyLine();
+  };
+  // калибровка: сколько кадров собрано, как сильно поворачивали телефон, что подобрано
+  const calLine = () => {
+    const c = tracker.calib;
+    if (!P.CALIB) return '';
+    if (c.lag === null) return `калибровка: кадров ${c.count}, поворот ${c.range.toFixed(0)}° (нужно ≥ 15°)\n`;
+    return `калибр.: задержка ${c.lag} мс (сейчас ${c.lagNow}${c.applied ? ', применено' : ''}, −${Math.round(c.lagGain * 100)}%)\n` +
+      `  обзор ${c.fov.toFixed(1)}° (сейчас ${c.fovNow}°, −${Math.round(c.kGain * 100)}%${c.saved ? ', сохранено' : ''})  поворот ${c.range.toFixed(0)}°\n`;
   };
   // самые длинные паузы за секунду: кадр отрисовки / обновление позы сцены / обработка кадра камеры
   const gapLine = () => {

@@ -6,7 +6,7 @@ import { MindARThree } from 'mindar-image-three';
 
 export function createTracker(opts) {
   const { container, markerUrl, CF, BETA, MISS, WARM, SYNC, RAW, JUMP, NOGUARD, onFound, onLost, onStall, onFatal,
-          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60, JERK = 1, JERKA = 10, JERKW = 200, HYBRID = 0, HYAGREE = 6, HYOVR = 0, HYBUDGET = 8, BUILDV = '0', DEDUP = 1, SEARCH = 0, EV = 0, LIVE = 0, LIVELAG = 40, PREDSMOOTH = 1, PREDV = 0, MARKER = 'image', BOARDN = 3, ARCEN = 1, COMBOTOL = 8,
+          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60, JERK = 1, JERKA = 10, JERKW = 200, HYBRID = 0, HYAGREE = 6, HYOVR = 0, HYBUDGET = 8, BUILDV = '0', DEDUP = 1, SEARCH = 0, EV = 0, LIVE = 0, LIVELAG = 40, PREDSMOOTH = 1, PREDV = 0, MARKER = 'image', BOARDN = 3, ARCEN = 1, COMBOTOL = 8, CALIB = 1, onCalib,
           PMC = 2, PB = 5, DMC = 0.6, DB = 2, RMC, RB, DC = 1, FOV = 66 } = opts;
 
   // MindAR просит у камеры только «заднюю камеру» — iPhone тогда снимает 30 кадров/с.
@@ -248,7 +248,7 @@ export function createTracker(opts) {
       if (curDup) stats.dups++;
       // на повторном кадре гироскоп не перечитываем — картинка та же
       if (isNew) {
-        if (imu && imu.fresh() && imu.hasAlpha) { imu.worldFromCamera(qWCframe, IMULAG + Math.max(0, now - frameT)); haveFrameQ = true; } else haveFrameQ = false;
+        if (imu && imu.fresh() && imu.hasAlpha) { imu.worldFromCamera(qWCframe, imuLag + Math.max(0, now - frameT)); haveFrameQ = true; } else haveFrameQ = false;
         // нет ориентации (телефон без гироскопа) — хотя бы «вверх» по акселерометру
         haveFrameUp = !haveFrameQ && !!(imu && imu.gravFresh && imu.gravFresh());
         if (haveFrameUp) imu.gravityUp(upFrame, gSign);
@@ -442,6 +442,85 @@ export function createTracker(opts) {
     } catch (e) { console.error('[метка] ошибка распознавания:', e); arucoM = null; }
   }
 
+  // ---- Калибровка «камера ↔ гироскоп» на живом телефоне ----
+  // Поворот сцены берётся из гироскопа, положение — из камеры. Это работает, только если они согласованы:
+  //  • задержка: кадр камеры приходит позже, чем показывает гироскоп (обычно 30–80 мс);
+  //  • угол обзора: от него зависит, где на экране точки над меткой (Земля), особенно вблизи.
+  // Метка неподвижна, значит её ориентация «в комнате» (гироскоп × камера) должна быть постоянной.
+  // Копим кадры и подбираем задержку и угол обзора, при которых она меньше всего «гуляет».
+  // Задержку применяем сразу; угол обзора — запоминаем на этом телефоне (MindAR берёт его только при запуске).
+  let imuLag = IMULAG;
+  const cal = { samples: [], lastEval: 0, n: 0, range: 0, lag: null, lagGain: 0, k: null, kGain: 0, fov: null, applied: false, saved: false };
+  const cq1 = new THREE.Quaternion(), cq2 = new THREE.Quaternion(), cqAvg = new THREE.Quaternion(), cv1 = new THREE.Vector3(), cvAvg = new THREE.Vector3();
+  function calibAdd() {
+    if (!imu || !imu.hasAlpha || !imu.orientationAt || curDup || !frameT || frozen || jerkingNow()) return;
+    if (cPos.z > -1e-6) return;
+    cal.samples.push({ t: frameT, q: cQ.clone(), u: cPos.x / -cPos.z, v: cPos.y / -cPos.z });
+    if (cal.samples.length > 450) cal.samples.shift();
+    const now = performance.now();
+    if (now - cal.lastEval > 2000 && cal.samples.length >= 150) { cal.lastEval = now; calibEval(); }
+  }
+  // насколько «гуляет» ориентация метки в комнате при задержке L (средний угол до среднего, градусы)
+  function spreadRot(L) {
+    const S = cal.samples; let n = 0; cqAvg.set(0, 0, 0, 0); const qs = [];
+    for (const p of S) {
+      if (!imu.orientationAt(cq1, p.t - L)) continue;
+      const q = cq1.clone().multiply(p.q);
+      if (qs.length && q.dot(qs[0]) < 0) q.set(-q.x, -q.y, -q.z, -q.w);
+      qs.push(q); cqAvg.x += q.x; cqAvg.y += q.y; cqAvg.z += q.z; cqAvg.w += q.w; n++;
+    }
+    if (n < 100) return Infinity;
+    cqAvg.normalize(); let sum = 0;
+    for (const q of qs) sum += 2 * Math.acos(Math.min(1, Math.abs(q.dot(cqAvg))));
+    return sum / n * 180 / Math.PI;
+  }
+  // насколько «гуляет» направление на метку в комнате при поправке фокуса k (настоящий фокус = k × текущий)
+  function spreadDir(L, k) {
+    const S = cal.samples; let n = 0; cvAvg.set(0, 0, 0); const ws = [];
+    for (const p of S) {
+      if (!imu.orientationAt(cq1, p.t - L)) continue;
+      const w = new THREE.Vector3(p.u / k, p.v / k, -1).normalize().applyQuaternion(cq1);
+      ws.push(w); cvAvg.add(w); n++;
+    }
+    if (n < 100) return Infinity;
+    cvAvg.normalize(); let sum = 0;
+    for (const w of ws) sum += w.angleTo(cvAvg);
+    return sum / n * 180 / Math.PI;
+  }
+  function calibEval() {
+    const S = cal.samples;
+    // насколько телефон поворачивался за это время (без поворота подбирать нечего)
+    let range = 0;
+    if (imu.orientationAt(cq2, S[0].t)) for (const p of S) if (imu.orientationAt(cq1, p.t)) range = Math.max(range, 2 * Math.acos(Math.min(1, Math.abs(cq1.dot(cq2)))) * 180 / Math.PI);
+    cal.n = S.length; cal.range = range;
+    if (range < 12) return;
+    let bestL = imuLag, best = Infinity;
+    for (let L = -20; L <= 150; L += 5) { const v = spreadRot(L); if (v < best) { best = v; bestL = L; } }
+    const cur = spreadRot(imuLag);
+    cal.lag = bestL; cal.lagGain = cur > 0 ? 1 - best / cur : 0;
+    let bestK = 1, bk = Infinity;
+    for (let k = 0.7; k <= 1.451; k += 0.025) { const v = spreadDir(bestL, k); if (v < bk) { bk = v; bestK = k; } }
+    const k1 = spreadDir(bestL, 1);
+    cal.k = bestK; cal.kGain = k1 > 0 ? 1 - bk / k1 : 0;
+    const W = ctrl ? ctrl.inputWidth : 480, H = ctrl ? ctrl.inputHeight : 640, f = intrinsics.f || ((Math.max(W, H) / 2) / Math.tan(FOV * Math.PI / 360));
+    cal.fov = 2 * Math.atan((Math.max(W, H) / 2) / (bestK * f)) * 180 / Math.PI;
+    // задержку применяем сразу, если она заметно лучше текущей
+    if (S.length >= 200 && range >= 15 && cal.lagGain > 0.15 && bestL !== imuLag) {
+      console.log(`[калибровка] задержка кадра ${bestL} мс (была ${imuLag}): разброс ${cur.toFixed(2)}° → ${best.toFixed(2)}°`);
+      imuLag = bestL; cal.applied = true;
+    }
+    // угол обзора — запоминаем для следующего запуска
+    if (S.length >= 200 && range >= 15 && cal.kGain > 0.15 && Math.abs(bestK - 1) >= 0.05 && onCalib) {
+      const fov = Math.round(cal.fov * 2) / 2;
+      if (cal.savedFov !== fov || cal.savedLag !== imuLag) {
+        onCalib({ fov, lag: imuLag }); cal.saved = true; cal.savedFov = fov; cal.savedLag = imuLag;
+        console.log(`[калибровка] угол обзора ≈ ${cal.fov.toFixed(1)}° (сейчас ${FOV}°) — сохранено, применится при следующем открытии`);
+      }
+    } else if (S.length >= 200 && range >= 15 && cal.lagGain > 0.15 && onCalib && cal.savedLag !== imuLag) {
+      onCalib({ fov: FOV, lag: imuLag }); cal.savedLag = imuLag;                // угол верный — запоминаем хотя бы задержку
+    }
+  }
+
   // ---- Рывок ----
   // На резком рывке кадр смазан, и трекер часто «тащит» позу за телефоном — сцена улетает.
   // Акселерометр и гироскоп замечают рывок мгновенно: на это время камере не верим, сцену быстро
@@ -550,6 +629,7 @@ export function createTracker(opts) {
     }
     stats.updates++;
     anchor.group.matrix.decompose(cPos, cQ, cS);
+    if (CALIB && !hyDriving) calibAdd();
     const s = Math.cbrt(Math.abs(cS.x * cS.y * cS.z));
     nrm.set(0, 0, 1).applyQuaternion(cQ);
 
@@ -1035,6 +1115,7 @@ export function createTracker(opts) {
     get frozen() { return frozen; },
     get loops() { return loopRuns; },
     get fiducial() { return fid ? { on: true, ...fid.stats, found: !!arucoM, combo: COMBO ? { ...comboStats, fromAruco: poseFromAruco } : null } : { on: FID, loading: FID }; },
+    get calib() { return { ...cal, samples: undefined, count: cal.samples.length, lagNow: imuLag, fovNow: FOV }; },
     get camMode() { return { fps: camFps, search: searchR, ev: evSet }; },
     // самые длинные паузы с прошлого вызова, мс
     takeGaps() { const g = { pose: gaps.pose, proc: gaps.proc }; gaps.pose = gaps.proc = 0; return g; },

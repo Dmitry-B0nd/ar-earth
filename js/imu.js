@@ -11,6 +11,11 @@ export function createImu() {
   // (кадр камеры доходит до программы с небольшой задержкой)
   const HIST = 32, hist = Array.from({ length: HIST }, () => ({ t: -1e9, a: 0, b: 0, g: 0 }));
   let hi = 0;
+  // длинная история (~15 с) — для калибровки: сравнить повороты по гироскопу и по камере задним числом
+  const LONG = 1024, longLog = Array.from({ length: LONG }, () => ({ t: -1e9, a: 0, b: 0, g: 0 }));
+  let li = 0;
+  const qA = new THREE.Quaternion(), qB = new THREE.Quaternion(), eA = new THREE.Euler();
+  const toQ = (s, out) => out.setFromEuler(eA.set(s.b * DEG, s.g * DEG, s.a * DEG, 'ZXY'));
   const tmpV = new THREE.Vector3();
   const euler = new THREE.Euler(), qScreen = new THREE.Quaternion(), zAxis = new THREE.Vector3(0, 0, 1);
 
@@ -33,6 +38,7 @@ export function createImu() {
     alpha = hasAlpha ? e.alpha : 0;
     t = performance.now(); count++;
     const h = hist[hi = (hi + 1) % HIST]; h.t = t; h.a = alpha; h.b = beta; h.g = gamma;
+    const L = longLog[li = (li + 1) % LONG]; L.t = t; L.a = alpha; L.b = beta; L.g = gamma;
   }
   // Резкие движения: ускорение без учёта силы тяжести (м/с²) и скорость поворота (°/с).
   // Пики копятся до чтения (для строки отладки); время последнего «рывка» — по заданным порогам.
@@ -119,6 +125,23 @@ export function createImu() {
       euler.set(b * DEG, g * DEG, a * DEG, 'ZXY');
       out.setFromEuler(euler);
       return out.multiply(qScreen.setFromAxisAngle(zAxis, -screenAngle()));
+    },
+
+    // ориентация камеры в мире на момент t (по длинной истории, с интерполяцией); false — нет данных
+    orientationAt(out, t) {
+      let k = li, prev = null;
+      for (let n = 0; n < LONG; n++) {
+        const s = longLog[k];
+        if (s.t <= t) {
+          if (s.t < 0) return false;
+          toQ(s, qA);
+          if (prev && prev.t > s.t) { toQ(prev, qB); qA.slerp(qB, (t - s.t) / (prev.t - s.t)); }
+          out.copy(qA).multiply(qScreen.setFromAxisAngle(zAxis, -screenAngle()));
+          return true;
+        }
+        prev = s; k = (k - 1 + LONG) % LONG;
+      }
+      return false;
     },
 
     // Вектор «вверх» в координатах камеры (единичный), записывается в out (THREE.Vector3)
