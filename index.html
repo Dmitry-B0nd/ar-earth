@@ -218,13 +218,13 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=4.27';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=4.27';
-import { createImu } from './js/imu.js?v=4.27';
-import { createViewer3D } from './js/viewer3d.js?v=4.27';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=4.27';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.27';
-const BUILD = '4.27';
+import { createTracker } from './js/tracking.js?v=4.28';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=4.28';
+import { createImu } from './js/imu.js?v=4.28';
+import { createViewer3D } from './js/viewer3d.js?v=4.28';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=4.28';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.28';
+const BUILD = '4.28';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -715,9 +715,10 @@ async function start(mode) {
   const calLine = () => {
     const c = tracker.calib;
     if (!P.CALIB) return '';
-    if (c.lag === null) return `калибровка: кадров ${c.count}, поворот ${c.range.toFixed(0)}° (нужно ≥ 15°)\n`;
-    return `калибр.: задержка ${c.lag} мс (сейчас ${c.lagNow}${c.applied ? ', применено' : ''}, −${Math.round(c.lagGain * 100)}%)\n` +
-      `  обзор ${c.fov.toFixed(1)}° (сейчас ${c.fovNow}°, −${Math.round(c.kGain * 100)}%${c.saved ? ', сохранено' : ''})  поворот ${c.range.toFixed(0)}°\n`;
+    const board = c.boardFov !== null ? `обзор по листу ${c.boardFov.toFixed(1)}° ±${c.boardSpread.toFixed(1)} (${c.fs.length} кадр., сейчас ${c.fovNow}°${c.saved ? ', сохранено' : ''})\n` :
+      (tracker.fiducial.on ? `обзор по листу: наклоните телефон, лист под углом (кадров ${c.fs.length})\n` : '');
+    if (c.lag === null) return `калибровка: кадров ${c.count}, поворот ${c.range.toFixed(0)}° (нужно ≥ 15°)\n` + board;
+    return `калибр.: задержка ${c.lag} мс (сейчас ${c.lagNow}${c.applied ? ', применено' : ''}, −${Math.round(c.lagGain * 100)}%)\n` + board;
   };
   // самые длинные паузы за секунду: кадр отрисовки / обновление позы сцены / обработка кадра камеры
   const gapLine = () => {

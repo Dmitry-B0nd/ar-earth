@@ -439,6 +439,7 @@ export function createTracker(opts) {
       const [mw, mh] = markerDims();
       const h = fid.detect(mw, mh);
       if (h) arucoM = HtoM(h);
+      if (CALIB) calibBoard();
     } catch (e) { console.error('[метка] ошибка распознавания:', e); arucoM = null; }
   }
 
@@ -450,7 +451,26 @@ export function createTracker(opts) {
   // Копим кадры и подбираем задержку и угол обзора, при которых она меньше всего «гуляет».
   // Задержку применяем сразу; угол обзора — запоминаем на этом телефоне (MindAR берёт его только при запуске).
   let imuLag = IMULAG;
-  const cal = { samples: [], lastEval: 0, n: 0, range: 0, lag: null, lagGain: 0, k: null, kGain: 0, fov: null, applied: false, saved: false };
+  const cal = { samples: [], lastEval: 0, n: 0, range: 0, lag: null, lagGain: 0, k: null, kGain: 0, fov: null, applied: false, saved: false,
+    fs: [], boardFov: null, boardSpread: null };
+  // угол обзора по листу меток (кадры, где лист виден под углом): медиана и разброс
+  function calibBoard() {
+    if (!fid || !fid.stats.fEst || !ctrl) return;
+    const long = Math.max(ctrl.inputWidth, ctrl.inputHeight);
+    cal.fs.push(2 * Math.atan((long / 2) / fid.stats.fEst) * 180 / Math.PI);
+    if (cal.fs.length > 300) cal.fs.shift();
+    if (cal.fs.length >= 20) {
+      const v = [...cal.fs].sort((x, y) => x - y), med = v[v.length >> 1];
+      const mad = [...v.map((x) => Math.abs(x - med))].sort((x, y) => x - y)[v.length >> 1];
+      cal.boardFov = med; cal.boardSpread = mad;
+      // устойчиво (разброс < 1°, кадров ≥ 60) и заметно отличается от текущего — запоминаем
+      const fov = Math.round(med * 2) / 2;
+      if (cal.fs.length >= 60 && mad < 1 && Math.abs(fov - FOV) >= 1 && onCalib && !(Math.abs((cal.savedFov ?? -99) - fov) < 1)) {
+        onCalib({ fov, lag: imuLag }); cal.saved = true; cal.savedFov = fov; cal.savedLag = imuLag;
+        console.log(`[калибровка] угол обзора по листу ${med.toFixed(1)}° ±${mad.toFixed(1)} (сейчас ${FOV}°) — сохранено, применится при следующем открытии`);
+      }
+    }
+  }
   const cq1 = new THREE.Quaternion(), cq2 = new THREE.Quaternion(), cqAvg = new THREE.Quaternion(), cv1 = new THREE.Vector3(), cvAvg = new THREE.Vector3();
   function calibAdd() {
     if (!imu || !imu.hasAlpha || !imu.orientationAt || curDup || !frameT || frozen || jerkingNow()) return;
@@ -510,14 +530,9 @@ export function createTracker(opts) {
       imuLag = bestL; cal.applied = true;
     }
     // угол обзора — запоминаем для следующего запуска
-    if (S.length >= 200 && range >= 15 && cal.kGain > 0.15 && Math.abs(bestK - 1) >= 0.05 && onCalib) {
-      const fov = Math.round(cal.fov * 2) / 2;
-      if (cal.savedFov !== fov || cal.savedLag !== imuLag) {
-        onCalib({ fov, lag: imuLag }); cal.saved = true; cal.savedFov = fov; cal.savedLag = imuLag;
-        console.log(`[калибровка] угол обзора ≈ ${cal.fov.toFixed(1)}° (сейчас ${FOV}°) — сохранено, применится при следующем открытии`);
-      }
-    } else if (S.length >= 200 && range >= 15 && cal.lagGain > 0.15 && onCalib && cal.savedLag !== imuLag) {
-      onCalib({ fov: FOV, lag: imuLag }); cal.savedLag = imuLag;                // угол верный — запоминаем хотя бы задержку
+    // угол обзора по движению руки ненадёжен (сдвиги руки путают) — только показываем; сохраняем — по листу меток
+    if (S.length >= 200 && range >= 15 && cal.lagGain > 0.15 && onCalib && cal.savedLag !== imuLag) {
+      onCalib({ fov: cal.savedFov || FOV, lag: imuLag }); cal.savedLag = imuLag;
     }
   }
 
