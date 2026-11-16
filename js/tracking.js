@@ -3,7 +3,7 @@
 // Единицы внутри content: ширина метки = 1, центр метки = (0,0,0), ось Z смотрит от метки вверх.
 import * as THREE from 'three';
 import { MindARThree } from 'mindar-image-three';
-import { createHybrid } from './hybrid.js?v=4.16';
+import { createHybrid } from './hybrid.js?v=4.17';
 
 export function createTracker(opts) {
   const { container, markerUrl, CF, BETA, MISS, WARM, SYNC, RAW, JUMP, NOGUARD, onFound, onLost, onStall, onFatal,
@@ -310,6 +310,9 @@ export function createTracker(opts) {
   if (JERK && imu && imu.setJerk) imu.setJerk(JERKA, JERKW);
   let jerkWas = false;
   const jerkingNow = () => !!(JERK && imu && imu.lastJerkT !== undefined && performance.now() - imu.lastJerkT < JERK_HOLD);
+  // самые длинные паузы за секунду (для отладки «микрофризов»): между обновлениями позы сцены и между обработанными кадрами
+  const gaps = { pose: 0, proc: 0, lastPose: 0, lastProc: 0 };
+  const markPose = () => { const t = performance.now(); if (gaps.lastPose) gaps.pose = Math.max(gaps.pose, t - gaps.lastPose); gaps.lastPose = t; };
   const stats = { rejected: 0, updates: 0, fused: 0, imuAngSum: 0, imuN: 0, redetect: 0, coast: 0, pred: 0, jerks: 0, get newFrames() { return newFrames; }, set newFrames(v) { newFrames = v; } };
 
   // ---- Подсказка трекеру: где метка окажется на следующем кадре ----
@@ -532,6 +535,7 @@ export function createTracker(opts) {
     last = now;
     sPos.copy(sDir).multiplyScalar(sDist);
     content.matrix.compose(sPos, sQ, sScale.set(sS, sS, sS));
+    markPose();
   }
   // Удержание: ставим сцену туда, где метка должна быть при ориентации телефона qWCnow в момент tNow.
   // Возвращает false, если удерживать нельзя (давно не было метки, нет датчиков, метка ушла из кадра).
@@ -551,7 +555,7 @@ export function createTracker(opts) {
     sPos.copy(sDir).multiplyScalar(sDist);
     last = performance.now();
     content.matrix.compose(sPos, sQ, sScale.set(sS, sS, sS));
-    stats.coast++;
+    markPose(); stats.coast++;
     return (coastOk = since <= COAST_MS);
   }
 
@@ -604,6 +608,7 @@ export function createTracker(opts) {
     ctrl.onUpdate = (data) => {
       if (data.type === 'processDone') {
         lastProcessed = realProcessed = performance.now(); loopRuns++;
+        if (gaps.lastProc) gaps.proc = Math.max(gaps.proc, realProcessed - gaps.lastProc); gaps.lastProc = realProcessed;
         // кадр обработан, а позы нет (смаз, перезахват) — поворачиваем сцену по гироскопу этого кадра
         if (PREDICT) predictLearn();
         if (hy) hySafe(hybridAfter);
@@ -826,6 +831,8 @@ export function createTracker(opts) {
     },
     get frozen() { return frozen; },
     get loops() { return loopRuns; },
+    // самые длинные паузы с прошлого вызова, мс
+    takeGaps() { const g = { pose: gaps.pose, proc: gaps.proc }; gaps.pose = gaps.proc = 0; return g; },
     get hybrid() { return hy ? { on: true, pts: hy.count, ms: hyStats.ms, drive: hyStats.drive, override: hyStats.override, revive: hyStats.revive, diff: hyStats.diff, seeds: hy.stats.seeds } : { on: false }; },
     // Лёгкий режим для слабых телефонов: камера 30 кадров/с (слабый трекер больше не успевает).
     // Чёткость рендера НЕ понижаем: на старом Android (трекер 15 Гц) это не ускорило трекер —
