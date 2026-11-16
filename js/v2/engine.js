@@ -10,15 +10,15 @@
 //  • Задержка кадра и угол обзора камеры подбираются сами, по ходу (без перезагрузки).
 // Наружу — тот же набор, что у первого движка: renderer, scene, camera, content (ширина листа = 1, Z — вверх от листа).
 import * as THREE from 'three';
-import { createSensors } from './sensors.js?v=5.1';
-import { createFusion } from './fusion.js?v=5.1';
+import { createSensors } from './sensors.js?v=5.2';
+import { createFusion } from './fusion.js?v=5.2';
 
-const VER = '5.1';
+const VER = '5.2';
 const CAL_KEY = 'ar-earth-v2-cal-5.1';   // новая версия подбора обзора — старые (смещённые) значения не берём
 
 export function createEngine2(opts) {
   const { container, onFound, onLost, onStall, FOV = 66, CAMFPS = 60, MAXPIX = 76800, BOARDM = 0.18, BG = 'gl',
-    SKIPBLUR = 30, KEEP = 8000, TT0 = 0, BUDGET = 14, LAG = null, SMOOTHCLK = false, GRAB = 'pixels', AA = true, AUTOCAL = true, NATIVELAG = 60 } = opts;
+    SKIPBLUR = 30, KEEP = 8000, TT0 = 0, BUDGET = 14, DELAY = -1, MAXDELAY = 110, LOCK = 0.7, LAG = null, SMOOTHCLK = false, GRAB = 'pixels', AA = true, AUTOCAL = true, NATIVELAG = 60 } = opts;
 
   // ---------- Рисование ----------
   const renderer = new THREE.WebGLRenderer({ antialias: AA, alpha: BG === 'native', powerPreference: 'default' });
@@ -40,11 +40,21 @@ export function createEngine2(opts) {
   scene.add(content);
 
   // фон — кадр камеры как текстура (обновляем только когда пришёл новый кадр)
-  const vtex = new THREE.Texture(video);
-  // помечаем как видео: three.js тогда не выделяет «неизменяемое» хранилище по размеру элемента (у <video> он 0×0),
-  // а обновляем текстуру сами — только на новом кадре (поэтому update() пустой)
-  vtex.isVideoTexture = true; vtex.update = () => {};
-  vtex.colorSpace = THREE.SRGBColorSpace; vtex.minFilter = THREE.LinearFilter; vtex.magFilter = THREE.LinearFilter; vtex.generateMipmaps = false;
+  // Несколько последних кадров храним в видеопамяти (кольцо): показываем кадр с небольшой задержкой — когда
+  // для него уже готово распознавание. Тогда сцена ставится по фактическому положению листа на этом самом кадре,
+  // а не по прогнозу: вблизи мелкие сдвиги руки (их не предскажешь) больше не дают дрожи.
+  const RING = 8;
+  const mkTex = () => {
+    const t = new THREE.Texture(video);
+    // помечаем как видео: three.js тогда не выделяет «неизменяемое» хранилище по размеру элемента (у <video> он 0×0),
+    // а обновляем текстуру сами — только на новом кадре (поэтому update() пустой)
+    t.isVideoTexture = true; t.update = () => {};
+    t.colorSpace = THREE.SRGBColorSpace; t.minFilter = THREE.LinearFilter; t.magFilter = THREE.LinearFilter; t.generateMipmaps = false;
+    return t;
+  };
+  const ring = Array.from({ length: DELAY === 0 ? 1 : RING }, () => ({ tex: mkTex(), n: -1, tf: 0, ta: 0 }));
+  let ringI = -1, shownSlot = null;
+  const vtex = ring[0].tex;
   const bg = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ map: vtex, depthTest: false, depthWrite: false, toneMapped: false }));
   bg.renderOrder = -1000; bg.frustumCulled = false; bg.visible = false;
   if (BG === 'gl') scene.add(bg);
@@ -53,7 +63,7 @@ export function createEngine2(opts) {
   const sensors = createSensors();
   let saved = {};
   try { saved = JSON.parse(localStorage.getItem(CAL_KEY) || '{}') || {}; } catch (e) {}
-  const fusion = createFusion({ sensors, boardM: BOARDM, lag: LAG ?? 50, autoLag: AUTOCAL, autoF: AUTOCAL });
+  const fusion = createFusion({ sensors, boardM: BOARDM, lag: LAG ?? 50, autoLag: AUTOCAL, autoF: AUTOCAL, lock: DELAY === 0 ? 0 : LOCK });
 
   // ---------- Состояние ----------
   let started = false, paused = false, frozen = false, frozenWant = false;
@@ -152,6 +162,7 @@ export function createEngine2(opts) {
     sec.roi = r.dw + '×' + r.dh + (r.sw < vw || r.sh < vh ? ' (участок)' : '');
     const id = ++frameId;
     busy = true; busySince = performance.now();
+    sentTa.set(id, vf.last);
     const t0 = performance.now();
     if (grabMode === 'bitmap' && worker) {
       createImageBitmap(video, r.sx, r.sy, r.sw, r.sh, { resizeWidth: r.dw, resizeHeight: r.dh, resizeQuality: 'low' }).then((bmp) => {
@@ -181,8 +192,17 @@ export function createEngine2(opts) {
 
   function flushMotion() { for (const m of sensors.takeMotion()) fusion.motion(m.t, m.acc, m.accG); }
 
+  // задержка показа: сколько обычно проходит от прихода кадра до готового распознавания (+ запас)
+  const sentTa = new Map();
+  let visLat = 40, delayMs = DELAY > 0 ? DELAY : 0;
   function onResult(m) {
     busy = false;
+    const ta = sentTa.get(m.id); sentTa.delete(m.id);
+    if (ta) {
+      const L = performance.now() - ta;
+      visLat += (L - visLat) * (L > visLat ? 0.3 : 0.05);         // вверх быстро, вниз медленно
+      if (DELAY < 0) delayMs = Math.min(MAXDELAY, visLat + 6);
+    }
     if (m.type === 'err') { sec.fails++; return; }
     const now = performance.now();
     visionLoops++; sec.res++;
@@ -276,7 +296,7 @@ export function createEngine2(opts) {
     const D = 50;
     bg.position.set(0, 0, -D); bg.scale.set(D * cw / fs, D * ch / fs, 1);
     const rx = cw / (s * vw), ry = ch / (s * vh);
-    vtex.repeat.set(rx, ry); vtex.offset.set((1 - rx) / 2, (1 - ry) / 2);
+    for (const r of ring) { r.tex.repeat.set(rx, ry); r.tex.offset.set((1 - rx) / 2, (1 - ry) / 2); }
     lastF = f;
   }
   function onVideoSize() {
@@ -340,13 +360,24 @@ export function createEngine2(opts) {
     let tDisp;
     if (BG === 'gl') {
       if (vf.fresh && video.videoWidth && video.readyState >= 2) {
-        // размер кадра сменился (или первый кадр) — текстуру пересоздаём: у WebGL размер хранилища фиксирован
+        // размер кадра сменился (или первый кадр) — текстуры пересоздаём: у WebGL размер хранилища фиксирован
         const sz = video.videoWidth + 'x' + video.videoHeight;
-        if (sz !== texSize) { if (texSize) vtex.dispose(); texSize = sz; }
-        vtex.needsUpdate = true; bg.visible = true; vf.fresh = false; needRender = true;
+        if (sz !== texSize) { if (texSize) ring.forEach((r) => { r.tex.dispose(); r.n = -1; }); texSize = sz; }
+        ringI = (ringI + 1) % ring.length;
+        const r = ring[ringI];
+        r.tex.needsUpdate = true; renderer.initTexture(r.tex);     // загружаем в видеопамять сразу, пока кадр в <video> этот
+        r.n = vf.n; r.tf = vf.t; r.ta = vf.last;
+        vf.fresh = false;
       }
-      else needRender = now - lastRenderT > 66;           // кадра нет — всё равно перерисовка не реже 15 раз/с
-      tDisp = vf.t;
+      // какой кадр показать: самый свежий из тех, что пришли не позже, чем delayMs назад
+      let pick = null;
+      for (const r of ring) if (r.n >= 0 && (now - r.ta >= delayMs || ring.length === 1) && (!pick || r.n > pick.n)) pick = r;
+      if (!pick) for (const r of ring) if (r.n >= 0 && (!pick || r.n < pick.n)) pick = r;      // все слишком свежие — самый старый
+      if (pick && pick !== shownSlot) {
+        shownSlot = pick; bg.material.map = pick.tex; bg.visible = true; needRender = true;
+        bg.material.needsUpdate = false;
+      } else needRender = now - lastRenderT > 66;           // кадр тот же — всё равно перерисовка не реже 15 раз/с
+      tDisp = shownSlot ? shownSlot.tf : vf.t;
     } else { tDisp = now - NATIVELAG; needRender = true; }
     if (needRender) lastRenderT = now;
     const ok = fusion.poseAt(tDisp, qOut, pOut, now);
@@ -389,6 +420,7 @@ export function createEngine2(opts) {
     const ext = sd.extra || 0; sd.extra = 0;
     const tags = sec.tags ? `меток ${sec.tags} (сторона ${sec.side.toFixed(0)} px)` : 'меток 0';
     return `движок 2  камера ${vw}×${vh} ${fr ? Math.round(fr) + ' к/с' : ''}, новых ${per(d.frames)}/с (время ${vf.mode})\n` +
+      `показ с задержкой ${delayMs.toFixed(0)} мс${DELAY < 0 ? ' (авто)' : ''}\n` +
       `поиск ${per(d.res)}/с: ${d.res ? (d.procMs / d.res).toFixed(1) : '—'} мс ${worker && workerOk ? 'в фоне' : 'в основном потоке'}` +
       ` + захват ${d.sent ? (d.grabMs / d.sent).toFixed(1) : '—'} мс\n` +
       `  ${sec.roi} (чёткость ${TARGET_TAG})  ${tags}  нашёл ${per(d.found)}/с  смаз: пропуск ${d.blurSkip} отказ ${F.diag.blurRej}${d.fails ? '  сбоев ' + d.fails : ''}\n` +
@@ -420,6 +452,8 @@ export function createEngine2(opts) {
     frame,
     get needRender() { return needRender; },
     get frames() { return vf.n; },
+    get shownFrame() { return shownSlot ? shownSlot.n : -1; },
+    get delayMs() { return delayMs; },
     get shown() { return content.visible; },
     get frozen() { return frozen; },
     get restarting() { return false; },

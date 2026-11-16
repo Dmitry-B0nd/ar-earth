@@ -104,26 +104,39 @@ export function rcvFromQuat(q, out = new Array(9)) {
 // съёмки кадра и переносим вперёд по истории, чтобы следующие поправки сравнивались с исправленными данными.
 export class Kf {
   static adapt = false;    // «разброс по обстановке» — на тестах дал меньше, чем повышение чёткости участка; выключен
-  constructor(mode, { sigA, tauV, sig0 = null, kAct = 0 }) {
+  static bias = true;      // фильтр с акселерометром оценивает и его смещение (постоянную ошибку)
+  constructor(mode, { sigA, tauV, sig0 = null, kAct = 0, sigB = 0.03 }) {
     this.mode = mode; this.sigA = sigA; this.tauV = tauV;
     // разброс ускорений «по обстановке»: телефон почти неподвижен — фильтр сильно усредняет распознавания (сцена не дрожит),
     // телефон резко двигают — быстро следует за ними. act — сколько сейчас ускоряется телефон (ед./с²), если известно
     this.sig0 = sig0; this.kAct = kAct; this.act = null;
-    this.x = new Float64Array(6); this.P = new Float64Array(36);
+    // Смещение акселерометра: даже 0,05 м/с² за 0,1 с между распознаваниями — это 0,25 мм, а вблизи Земли — пиксели дрожи.
+    // Поэтому у фильтра с акселерометром ещё 3 числа состояния — смещение b (медленно меняется, sigB м/с² за √с).
+    this.N = mode === 'acc' && Kf.bias ? 9 : 6; this.sigB = sigB;
+    const N = this.N;
+    this.x = new Float64Array(N); this.P = new Float64Array(N * N); this.T = new Float64Array(N * N);
     this.t = 0; this.ok = false;
-    this.HN = 256; this.ht = new Float64Array(this.HN); this.hx = new Float64Array(this.HN * 6); this.hi = 0; this.hn = 0;
+    this.HN = 256; this.ht = new Float64Array(this.HN); this.hx = new Float64Array(this.HN * N); this.hi = 0; this.hn = 0;
     this.nis = 3; this.perr = 4; this.lastMeasT = -1e9;
   }
   reset(p, t, sigP = 0.05, sigV = 2, v = null) {
+    const N = this.N;
+    this.upd = [];
+    const b = N === 9 && this.ok ? [this.x[6], this.x[7], this.x[8]] : [0, 0, 0];     // смещение при сбросе сохраняем
     this.x.fill(0); this.x[0] = p[0]; this.x[1] = p[1]; this.x[2] = p[2];
     if (v && this.mode !== 'hold') { this.x[3] = v[0]; this.x[4] = v[1]; this.x[5] = v[2]; }
+    if (N === 9) { this.x[6] = b[0]; this.x[7] = b[1]; this.x[8] = b[2]; }
     this.P.fill(0);
-    for (let i = 0; i < 3; i++) { this.P[i * 7] = sigP * sigP; this.P[(i + 3) * 7] = sigV * sigV; }
+    for (let i = 0; i < 3; i++) {
+      this.P[i * (N + 1)] = sigP * sigP; this.P[(i + 3) * (N + 1)] = sigV * sigV;
+      if (N === 9) this.P[(i + 6) * (N + 1)] = (0.15 / 0.18) ** 2;
+    }
     this.t = t; this.ok = true; this.hn = 0; this.push(); this.lastMeasT = t;
   }
   push() {
+    const N = this.N;
     this.hi = (this.hi + 1) % this.HN; this.ht[this.hi] = this.t;
-    for (let i = 0; i < 6; i++) this.hx[this.hi * 6 + i] = this.x[i];
+    for (let i = 0; i < N; i++) this.hx[this.hi * N + i] = this.x[i];
     if (this.hn < this.HN) this.hn++;
   }
   // шаг вперёд до времени t (с), a — ускорение телефона в осях комнаты (ед./с²) или null
@@ -133,42 +146,53 @@ export class Kf {
     let dt = t - this.t;
     if (dt <= 0) return;
     if (dt > 0.25) dt = 0.25;
-    const x = this.x;
+    const N = this.N, x = this.x;
     // без распознавания дольше 0,5 с — перестаём «ехать»: сцена стоит в комнате на месте
     const stale = t - this.lastMeasT > 0.5;
-    let useA = this.mode === 'acc' && a && !stale;
+    const useA = this.mode === 'acc' && a && !stale;
     // ускорение на отрезке — среднее между началом и концом (а не значение в конце: иначе запаздывание на полшага)
     let am = a;
     if (useA && this.lastA) { am = this._am || (this._am = [0, 0, 0]); for (let i = 0; i < 3; i++) am[i] = (a[i] + this.lastA[i]) / 2; }
     if (a) { this.lastA = this.lastA || [0, 0, 0]; this.lastA[0] = a[0]; this.lastA[1] = a[1]; this.lastA[2] = a[2]; } else this.lastA = null;
     const tau = stale || this.mode === 'hold' ? 0.02 : this.tauV;
-    const d = Math.exp(-dt / tau);
+    const d = Math.exp(-dt / tau), g = dt * (1 + d) / 2, h2 = 0.5 * dt * dt;
+    const bOn = N === 9 && useA;
     for (let i = 0; i < 3; i++) {
-      const ai = useA ? -am[i] : 0;
-      x[i] += x[i + 3] * dt * (1 + d) / 2 + 0.5 * ai * dt * dt;
+      const ai = useA ? -(am[i] - (N === 9 ? x[6 + i] : 0)) : 0;     // p'' = −(a − b)
+      x[i] += x[i + 3] * g + h2 * ai;
       x[i + 3] = x[i + 3] * d + ai * dt;
     }
-    // P = Φ P Φᵀ + Q (Φ: p += v·dt·(1+d)/2, v *= d)
-    const P = this.P, g = dt * (1 + d) / 2;
-    const T = this.T || (this.T = new Float64Array(36));
-    for (let r = 0; r < 6; r++) for (let c = 0; c < 6; c++) {     // T = Φ P
-      if (r < 3) T[r * 6 + c] = P[r * 6 + c] + g * P[(r + 3) * 6 + c];
-      else T[r * 6 + c] = d * P[r * 6 + c];
+    // P = Φ P Φᵀ + Q.  Φ: p ← p + g·v + (bOn ? h2·b : 0);  v ← d·v + (bOn ? dt·b : 0);  b ← b
+    const P = this.P, T = this.T;
+    for (let c = 0; c < N; c++) {
+      for (let i = 0; i < 3; i++) {
+        T[i * N + c] = P[i * N + c] + g * P[(i + 3) * N + c] + (bOn ? h2 * P[(i + 6) * N + c] : 0);
+        T[(i + 3) * N + c] = d * P[(i + 3) * N + c] + (bOn ? dt * P[(i + 6) * N + c] : 0);
+        if (N === 9) T[(i + 6) * N + c] = P[(i + 6) * N + c];
+      }
     }
-    for (let r = 0; r < 6; r++) for (let c = 0; c < 6; c++) {     // P = T Φᵀ
-      if (c < 3) P[r * 6 + c] = T[r * 6 + c] + g * T[r * 6 + c + 3];
-      else P[r * 6 + c] = d * T[r * 6 + c];
+    for (let r = 0; r < N; r++) {
+      for (let i = 0; i < 3; i++) {
+        P[r * N + i] = T[r * N + i] + g * T[r * N + i + 3] + (bOn ? h2 * T[r * N + i + 6] : 0);
+        P[r * N + i + 3] = d * T[r * N + i + 3] + (bOn ? dt * T[r * N + i + 6] : 0);
+        if (N === 9) P[r * N + i + 6] = T[r * N + i + 6];
+      }
     }
     const sA = this.sig0 != null && this.act != null && Kf.adapt ? this.sig0 + this.kAct * this.act : this.sigA;
     const q = sA * sA * (stale ? 0.1 : 1);
     const q11 = q * dt * dt * dt * dt / 4, q12 = q * dt * dt * dt / 2, q22 = q * dt * dt;
-    for (let i = 0; i < 3; i++) { P[i * 7] += q11; P[i * 6 + i + 3] += q12; P[(i + 3) * 6 + i] += q12; P[(i + 3) * 7] += q22; }
+    const qb = N === 9 ? (this.sigB / 0.18) ** 2 * dt : 0;
+    for (let i = 0; i < 3; i++) {
+      P[i * (N + 1)] += q11; P[i * N + i + 3] += q12; P[(i + 3) * N + i] += q12; P[(i + 3) * (N + 1)] += q22;
+      if (N === 9) P[(i + 6) * (N + 1)] += qb;
+    }
     this.t += dt; if (this.t < t) this.t = t;
     this.push();
   }
-  // состояние на момент t (из истории), в out[6]; true — нашлось
+  // состояние (положение и скорость) на момент t (из истории), в out[6]; true — нашлось
   stateAt(t, out) {
     if (!this.ok) return false;
+    const N = this.N;
     if (t >= this.t) {
       const dt = Math.min(t - this.t, 0.1);
       for (let i = 0; i < 3; i++) { out[i] = this.x[i] + this.x[i + 3] * dt; out[i + 3] = this.x[i + 3]; }
@@ -181,15 +205,29 @@ export class Kf {
         const k2 = (k + 1) % this.HN;
         if (n > 0) {
           const t2 = this.ht[k2], w = t2 > tk ? (t - tk) / (t2 - tk) : 0;
-          for (let i = 0; i < 6; i++) out[i] = this.hx[k * 6 + i] * (1 - w) + this.hx[k2 * 6 + i] * w;
-        } else for (let i = 0; i < 6; i++) out[i] = this.hx[k * 6 + i];
+          for (let i = 0; i < 6; i++) out[i] = this.hx[k * N + i] * (1 - w) + this.hx[k2 * N + i] * w;
+        } else for (let i = 0; i < 6; i++) out[i] = this.hx[k * N + i];
         return true;
       }
       k = (k - 1 + this.HN) % this.HN;
     }
-    // старше всей истории — самое раннее
     const k0 = (this.hi - this.hn + 1 + this.HN) % this.HN;
-    for (let i = 0; i < 6; i++) out[i] = this.hx[k0 * 6 + i];
+    for (let i = 0; i < 6; i++) out[i] = this.hx[k0 * N + i];
+    return true;
+  }
+  // Состояние на момент t, но с учётом и БОЛЕЕ ПОЗДНЕГО распознавания (если оно уже есть): поправку,
+  // найденную в момент следующего распознавания, распределяем по кадрам между ним и предыдущим —
+  // получается не прогноз вперёд, а сглаживание между двумя измерениями.
+  smoothAt(t, out) {
+    if (!this.stateAt(t, out)) return false;
+    const u = this.upd;
+    if (!u || !u.length) return true;
+    let k = -1;
+    for (let i = 0; i < u.length; i++) if (u[i].tm > t) { k = i; break; }
+    if (k < 0) return true;
+    const t0 = k > 0 ? u[k - 1].tm : u[k].tm - 0.1;
+    const w = Math.max(0, Math.min(1, (t - t0) / Math.max(1e-3, u[k].tm - t0)));
+    for (let i = 0; i < 3; i++) out[i] += w * u[k].dp[i];
     return true;
   }
   // поправка по распознаванию: z (3) — положение листа на момент tm, Rm — его погрешность (3×3, по строкам)
@@ -197,11 +235,12 @@ export class Kf {
   update(tm, z, Rm, gate = Infinity, minPass = 0) {
     if (!this.ok) return -1;
     if (tm > this.t) this.predict(tm, null);
-    const xs = new Float64Array(6);
+    const N = this.N;
+    const xs = this._xs || (this._xs = new Float64Array(6));
     this.stateAt(tm, xs);
     const y = [z[0] - xs[0], z[1] - xs[1], z[2] - xs[2]];
     const P = this.P;
-    const S = [0, 1, 2].flatMap((r) => [0, 1, 2].map((c) => P[r * 6 + c] + Rm[r * 3 + c]));
+    const S = [0, 1, 2].flatMap((r) => [0, 1, 2].map((c) => P[r * N + c] + Rm[r * 3 + c]));
     const Si = inv3(S);
     if (!Si) return -1;
     const nis = y[0] * (Si[0] * y[0] + Si[1] * y[1] + Si[2] * y[2]) + y[1] * (Si[3] * y[0] + Si[4] * y[1] + Si[5] * y[2]) + y[2] * (Si[6] * y[0] + Si[7] * y[1] + Si[8] * y[2]);
@@ -215,30 +254,39 @@ export class Kf {
       this.perr = this.perr * 0.9 + this.lastPe * 0.1;      // в логарифме: различает и малые, и огромные промахи
     }
     if (nis > gate && Math.hypot(y[0], y[1], y[2]) > minPass) return -1;
-    // K = P[:,0:3] S⁻¹ (6×3)
-    const K = new Float64Array(18);
-    for (let r = 0; r < 6; r++) for (let c = 0; c < 3; c++) K[r * 3 + c] = P[r * 6] * Si[c] + P[r * 6 + 1] * Si[3 + c] + P[r * 6 + 2] * Si[6 + c];
-    const dx = new Float64Array(6);
-    for (let r = 0; r < 6; r++) dx[r] = K[r * 3] * y[0] + K[r * 3 + 1] * y[1] + K[r * 3 + 2] * y[2];
+    // K = P[:,0:3] S⁻¹ (N×3)
+    const K = new Float64Array(N * 3);
+    for (let r = 0; r < N; r++) for (let c = 0; c < 3; c++) K[r * 3 + c] = P[r * N] * Si[c] + P[r * N + 1] * Si[3 + c] + P[r * N + 2] * Si[6 + c];
+    const dx = new Float64Array(N);
+    for (let r = 0; r < N; r++) dx[r] = K[r * 3] * y[0] + K[r * 3 + 1] * y[1] + K[r * 3 + 2] * y[2];
     // переносим поправку вперёд: в историю после tm и в текущее состояние
-    // (поправка скорости со временем затухает так же, как скорость в модели фильтра)
+    // (поправка скорости со временем затухает так же, как скорость в модели фильтра; поправка смещения — копится)
     const tau = this.mode === 'hold' ? 0.02 : this.tauV;
     const gp = (dt) => tau * (1 - Math.exp(-dt / tau)), gv = (dt) => Math.exp(-dt / tau);
+    const apply = (arr, o, dt) => {
+      const a = gp(dt), b = gv(dt);
+      for (let i = 0; i < 3; i++) {
+        arr[o + i] += dx[i] + a * dx[i + 3] + (N === 9 ? 0.5 * dt * dt * dx[i + 6] : 0);
+        arr[o + i + 3] += b * dx[i + 3] + (N === 9 ? dt * dx[i + 6] : 0);
+        if (N === 9) arr[o + i + 6] += dx[i + 6];
+      }
+    };
     let k = this.hi;
     for (let n = 0; n < this.hn; n++) {
       const tk = this.ht[k];
       if (tk < tm) break;
-      const a = gp(tk - tm), b = gv(tk - tm);
-      for (let i = 0; i < 3; i++) { this.hx[k * 6 + i] += dx[i] + a * dx[i + 3]; this.hx[k * 6 + i + 3] += b * dx[i + 3]; }
+      apply(this.hx, k * N, tk - tm);
       k = (k - 1 + this.HN) % this.HN;
     }
-    const an = gp(this.t - tm), bn = gv(this.t - tm);
-    for (let i = 0; i < 3; i++) { this.x[i] += dx[i] + an * dx[i + 3]; this.x[i + 3] += bn * dx[i + 3]; }
-    // P = P − K S Kᵀ  (= P − K·P[0:3,:])
-    const P0 = P.slice(0, 18);
-    for (let r = 0; r < 6; r++) for (let c = 0; c < 6; c++) P[r * 6 + c] -= K[r * 3] * P0[c] + K[r * 3 + 1] * P0[6 + c] + K[r * 3 + 2] * P0[12 + c];
-    for (let r = 0; r < 6; r++) for (let c = r + 1; c < 6; c++) { const m = (P[r * 6 + c] + P[c * 6 + r]) / 2; P[r * 6 + c] = P[c * 6 + r] = m; }
+    apply(this.x, 0, this.t - tm);
+    // P = P − K·P[0:3,:]
+    const P0 = P.slice(0, 3 * N);
+    for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) P[r * N + c] -= K[r * 3] * P0[c] + K[r * 3 + 1] * P0[N + c] + K[r * 3 + 2] * P0[2 * N + c];
+    for (let r = 0; r < N; r++) for (let c = r + 1; c < N; c++) { const m = (P[r * N + c] + P[c * N + r]) / 2; P[r * N + c] = P[c * N + r] = m; }
     this.lastMeasT = Math.max(this.lastMeasT, tm);
+    // запоминаем поправку — чтобы кадры МЕЖДУ распознаваниями (показываем с задержкой) получили её плавно
+    this.upd.push({ tm, dp: [dx[0], dx[1], dx[2]] });
+    if (this.upd.length > 12) this.upd.shift();
     return nis;
   }
 }
@@ -251,7 +299,8 @@ export function createFusion(opts = {}) {
     lag: 50,             // начальная задержка кадра относительно датчиков, мс
     autoLag: true, autoF: true,
     alphaQ: 0.35,        // скорость поправки поворота листа
-    blendMs: 90,         // поправки на экране — плавно за это время
+    blendMs: 90,
+    lock: 0,             // показ с задержкой: насколько ставить кадр по его собственному распознаванию (0…1)         // поправки на экране — плавно за это время
     sigPx: 0.6,          // погрешность угла метки на кадре, пиксели (на резком кадре)
     expo: 0.016,         // время выдержки камеры, с (для оценки смаза)
     snapDeg: 12,         // лист лежит горизонтально, если наклон < этого
@@ -329,6 +378,7 @@ export function createFusion(opts = {}) {
   const qWC = new THREE.Quaternion(), qCM = new THREE.Quaternion(), qMeas = new THREE.Quaternion(), qT = new THREE.Quaternion();
   const zAx = new THREE.Vector3(0, 0, 1);
   const resetTimes = [], ban = {}; let forceReset = false;
+  const meas = []; let lastLockTf = -1;
   let outlierQ = 0, outlierP = 0, lastOutlierQ = new THREE.Quaternion(), lastZ = null, lastZt = 0, lastZblur = 0;
   function measure(d) {
     const tm = d.tFrame - st.lag;
@@ -450,6 +500,9 @@ export function createFusion(opts = {}) {
       chooseFilter();
     }
     lastZ = z; lastZt = tms; lastZblur = blurPx;
+    // измерение «этого самого кадра» — для показа с задержкой: кадр, у которого есть своё распознавание,
+    // ставим по нему (сцена жёстко привязана к картинке — без дрожи от неточного прогноза)
+    meas.push({ tf: d.tFrame, z: z.slice(), sl }); if (meas.length > 16) meas.shift();
     for (const k in filters) st.diag.nis[k] = filters[k].perr;
     // плавность: разница между старым и новым видом уходит за blendMs
     if (before && st.init && !reset) {
@@ -473,7 +526,9 @@ export function createFusion(opts = {}) {
     // Знак ускорения: сначала — по гравитации; но если при заметных рывках «обратный» фильтр раз за разом
     // предсказывает лучше — значит, у этого браузера ускорение и гравитация с разными знаками: переходим на него
     const wrong = signEv > 25 ? 'acc+' : 'acc-';
-    const score = (k) => filters[k].perr + (k === wrong && (gSign !== 0 || signEv > 25) ? (Math.abs(gVotes) >= 20 || signEv > 25 ? 5 : 0.5) : 0);
+    // при равных — предпочитаем фильтр с акселерометром: мелкую дрожь руки между распознаваниями видит только он
+    const pref = { 'acc+': 0, 'acc-': 0, cv: 0.25, hold: 0.5 };
+    const score = (k) => filters[k].perr + pref[k] + (k === wrong && (gSign !== 0 || signEv > 25) ? (Math.abs(gVotes) >= 20 || signEv > 25 ? 5 : 0.5) : 0);
     if (o.force) { st.filt = o.force; return; }
     const banned = (k) => nowf() < (ban[k] || 0);
     if (banned(st.filt)) st.filt = 'hold';
@@ -486,7 +541,7 @@ export function createFusion(opts = {}) {
   }
 
   function currentP(tMs, out) {
-    filters[st.filt].stateAt(tMs / 1000, xs);
+    filters[st.filt].smoothAt(tMs / 1000, xs);
     return out.set(xs[0], xs[1], xs[2]);
   }
 
@@ -505,7 +560,21 @@ export function createFusion(opts = {}) {
     offP.multiplyScalar(k);
     qOff.slerp(tq.identity(), 1 - k);
     tickTo(t);
-    currentP(t, outP).add(offP);
+    currentP(t, outP);
+    if (o.lock > 0) {
+      // есть распознавание ровно этого кадра — притягиваем к нему (доля lock), иначе — сглаженное между соседними
+      for (let i = meas.length - 1; i >= 0; i--) {
+        const m = meas[i];
+        if (Math.abs(m.tf - tFrame) < 2) {
+          if (m.tf !== lastLockTf) {           // насколько прогноз расходился с распознаванием этого кадра — мерило дрожи
+            lastLockTf = m.tf;
+            st.diag.corr += Math.hypot(m.z[0] - outP.x, m.z[1] - outP.y, m.z[2] - outP.z) / Math.max(0.3, outP.length()) * st.f; st.diag.corrN++;
+          }
+          outP.x += o.lock * (m.z[0] - outP.x); outP.y += o.lock * (m.z[1] - outP.y); outP.z += o.lock * (m.z[2] - outP.z); break; }
+        if (m.tf < tFrame - 10) break;
+      }
+    }
+    outP.add(offP);
     lastOutT = t;
     const qInv = tq2.copy(qCam).invert();
     outQ.copy(qInv).multiply(qOff).multiply(st.qMW);
