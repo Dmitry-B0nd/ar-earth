@@ -6,7 +6,7 @@ import { MindARThree } from 'mindar-image-three';
 
 export function createTracker(opts) {
   const { container, markerUrl, CF, BETA, MISS, WARM, SYNC, RAW, JUMP, NOGUARD, onFound, onLost, onStall, onFatal,
-          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60, JERK = 1, JERKA = 10, JERKW = 200, HYBRID = 0, HYAGREE = 6, HYOVR = 0, HYBUDGET = 8, BUILDV = '0', DEDUP = 1, SEARCH = 0, EV = 0, LIVE = 0, LIVELAG = 40, PREDSMOOTH = 1, PREDV = 0, MARKER = 'image',
+          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60, JERK = 1, JERKA = 10, JERKW = 200, HYBRID = 0, HYAGREE = 6, HYOVR = 0, HYBUDGET = 8, BUILDV = '0', DEDUP = 1, SEARCH = 0, EV = 0, LIVE = 0, LIVELAG = 40, PREDSMOOTH = 1, PREDV = 0, MARKER = 'image', BOARDN = 2,
           PMC = 2, PB = 5, DMC = 0.6, DB = 2, RMC, RB, DC = 1, FOV = 66 } = opts;
 
   // MindAR просит у камеры только «заднюю камеру» — iPhone тогда снимает 30 кадров/с.
@@ -393,7 +393,7 @@ export function createTracker(opts) {
   // Всё остальное (гироскоп, сглаживание, удержание, синхронизация) работает как обычно.
   const ARUCO = MARKER === 'aruco';
   let fid = null, arucoM = null;
-  if (ARUCO) import('./fiducial.js?v=' + BUILDV).then((m) => { fid = m.createFiducial(); console.log('[метка] режим: лист квадратных меток'); })
+  if (ARUCO) import('./fiducial.js?v=' + BUILDV).then((m) => { m.setBoard(BOARDN); fid = m.createFiducial(); console.log('[метка] режим: лист квадратных меток ' + BOARDN + '×' + BOARDN); })
     .catch((e) => console.error('[метка] распознаватель не загрузился:', e));
   function fidFrame(src) {
     arucoM = null;

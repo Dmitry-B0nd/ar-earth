@@ -218,13 +218,13 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=4.23';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=4.23';
-import { createImu } from './js/imu.js?v=4.23';
-import { createViewer3D } from './js/viewer3d.js?v=4.23';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=4.23';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.23';
-const BUILD = '4.23';
+import { createTracker } from './js/tracking.js?v=4.24';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=4.24';
+import { createImu } from './js/imu.js?v=4.24';
+import { createViewer3D } from './js/viewer3d.js?v=4.24';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=4.24';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.24';
+const BUILD = '4.24';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -238,7 +238,9 @@ const P = {
   // трекинг (подобрано в День 1)
   CF: num('cf', 1), BETA: num('beta', 0),
   // сглаживание: направление на метку (pmc/pb), расстояние (dmc/db), поворот (rmc/rb), реакция на движение (dc)
-  PMC: num('pmc', 2), PB: num('pb', 5), DMC: num('dmc', 0.6), DB: num('db', 2),
+  // с листом меток поза точная — сглаживаем намного слабее (иначе сцена «пружинит», догоняя лист)
+  PMC: num('pmc', q.get('marker') === 'aruco' ? 8 : 2), PB: num('pb', q.get('marker') === 'aruco' ? 10 : 5),
+  DMC: num('dmc', q.get('marker') === 'aruco' ? 4 : 0.6), DB: num('db', q.get('marker') === 'aruco' ? 6 : 2),
   RMC: q.has('rmc') ? num('rmc') : undefined, RB: q.has('rb') ? num('rb') : undefined, DC: num('dc', 1),
   // датчики телефона: наклон метки берём из гироскопа (метка лежит на столе)
   // поворот сцены — из гироскопа, камера медленно подправляет (kmw); imulag — задержка кадра камеры, мс
@@ -253,7 +255,7 @@ const P = {
   // камера 30 к/с: dedup=0 — обрабатывать повторные кадры; search — зона поиска MindAR (0 — авто: 15 при 30 к/с, 10 при 60);
   // ev — поправка экспозиции (например -1: короче выдержка, меньше смаз; только Android)
   // marker=aruco — лист квадратных меток (marker/aruco-A4.pdf) вместо картинки
-  MARKER: q.get('marker') === 'aruco' ? 'aruco' : 'image',
+  MARKER: q.get('marker') === 'aruco' ? 'aruco' : 'image', BOARDN: num('board', 2),
   DEDUP: num('dedup', 1), SEARCH: num('search', 0), EV: num('ev', 0),
   HYBRID: num('hybrid', 0), HYAGREE: num('hyagree', 6), HYBUDGET: num('hybudget', 8), BUILDV: BUILD,
   // hyovr=1 — поток может перебивать позу MindAR при сильном расхождении (в 5.0h было включено)
@@ -713,7 +715,7 @@ async function start(mode) {
   };
   const hyLine = () => {
     const f = tracker.fiducial;
-    if (f.on) return f.loading ? 'метки: загрузка…\n' : `метки: найдено ${f.markers} из 9  ${f.ms.toFixed(1)} мс${f.full ? ' (полный кадр)' : ''}  ошибка ${f.err.toFixed(2)} px\n`;
+    if (f.on) return f.loading ? 'метки: загрузка…\n' : `метки: найдено ${f.markers} из ${f.total}  ${f.ms.toFixed(1)} мс${f.full ? ' (полный кадр)' : ''}  ошибка ${f.err.toFixed(2)} px\n`;
     const h = tracker.hybrid;
     if (!h.on) return h.level >= 3 ? 'гибрид: выкл (дорого для телефона)\n' : 'гибрид: выкл\n';
     const lv = h.level === 1 ? '  через кадр' : '';

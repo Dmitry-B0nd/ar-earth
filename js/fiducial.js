@@ -11,7 +11,14 @@
 import { AR, CV } from './vendor/aruco.mjs';
 import jsfeat from './vendor/jsfeat.mjs';
 
-export const BOARD = { cols: 3, rows: 3, s: 0.28, g: 0.08, firstId: 0 };
+// 2×2 — метки крупнее (8 см, клетка 13,5 мм): устойчивее к смазу на слабых телефонах (по умолчанию);
+// 3×3 — метки мельче (5 см), но больше углов (?board=3). Метки 0–3 и 0–8: листы разные — печатать нужный.
+export const BOARDS = {
+  2: { cols: 2, rows: 2, s: 0.45, g: 0.10, firstId: 0 },
+  3: { cols: 3, rows: 3, s: 0.28, g: 0.08, firstId: 0 },
+};
+export let BOARD = BOARDS[2];
+export function setBoard(n) { BOARD = BOARDS[n] || BOARDS[2]; return BOARD; }
 
 // углы метки id на листе (TL, TR, BR, BL) в долях ширины листа, или null, если такой метки на листе нет
 export function boardCorners(id) {
@@ -32,7 +39,7 @@ export function createFiducial() {
   const MAXP = 64;
   const from = Array.from({ length: MAXP }, () => ({ x: 0, y: 0 })), to = Array.from({ length: MAXP }, () => ({ x: 0, y: 0 }));
   const mask = new jsfeat.matrix_t(MAXP, 1, jsfeat.U8_t | jsfeat.C1_t);
-  const stats = { ms: 0, markers: 0, err: 0, full: false };
+  const stats = { ms: 0, markers: 0, total: BOARD.cols * BOARD.rows, err: 0, full: false };
 
   function alloc(w, h) {
     W = w; H = h; cv.width = w; cv.height = h;
