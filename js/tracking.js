@@ -6,7 +6,7 @@ import { MindARThree } from 'mindar-image-three';
 
 export function createTracker(opts) {
   const { container, markerUrl, CF, BETA, MISS, WARM, SYNC, RAW, JUMP, NOGUARD, onFound, onLost, onStall, onFatal,
-          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60, JERK = 1, JERKA = 10, JERKW = 200, HYBRID = 0, HYAGREE = 6, HYOVR = 0, HYBUDGET = 8, BUILDV = '0', DEDUP = 1, SEARCH = 0, EV = 0, LIVE = 0, LIVELAG = 40, PREDSMOOTH = 1, PREDV = 0, MARKER = 'image', BOARDN = 3, ARCEN = 1,
+          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60, JERK = 1, JERKA = 10, JERKW = 200, HYBRID = 0, HYAGREE = 6, HYOVR = 0, HYBUDGET = 8, BUILDV = '0', DEDUP = 1, SEARCH = 0, EV = 0, LIVE = 0, LIVELAG = 40, PREDSMOOTH = 1, PREDV = 0, MARKER = 'image', BOARDN = 3, ARCEN = 1, COMBOTOL = 8,
           PMC = 2, PB = 5, DMC = 0.6, DB = 2, RMC, RB, DC = 1, FOV = 66 } = opts;
 
   // MindAR просит у камеры только «заднюю камеру» — iPhone тогда снимает 30 кадров/с.
@@ -183,6 +183,29 @@ export function createTracker(opts) {
       ctrl._detectAndMatch = () => Promise.resolve(arucoM ? { targetIndex: 0, modelViewTransform: copyM() } : { targetIndex: -1 });
       ctrl._trackAndUpdate = () => Promise.resolve(arucoM ? copyM() : null);
     }
+    if (COMBO) {
+      // Картинка + квадратные метки. Поза по меткам (с нуля на каждом кадре, «утащить» нельзя) — начальная
+      // точка для MindAR; MindAR уточняет её по картинке (точнее вблизи). Не справился или ушёл от меток
+      // дальше COMBOTOL пикселей — берём позу по меткам. Меток не видно — MindAR работает как обычно.
+      const tu0 = ctrl._trackAndUpdate.bind(ctrl), dm0 = ctrl._detectAndMatch.bind(ctrl);
+      const copyA = () => arucoM.map((r) => r.slice());
+      ctrl._detectAndMatch = (inp, list) => {
+        if (arucoM) { poseFromAruco = true; return Promise.resolve({ targetIndex: 0, modelViewTransform: copyA() }); }
+        return dm0(inp, list);
+      };
+      ctrl._trackAndUpdate = async (inp, M, i) => {
+        const r = await tu0(inp, arucoM ? copyA() : M, i);
+        if (!arucoM) { poseFromAruco = false; return r; }
+        const d = r ? poseDiff(r, arucoM) : Infinity;
+        comboStats.diff = d === Infinity ? -1 : d;
+        // по 1–2 меткам (часто неполным, у края кадра) поза грубее, чем по картинке: тогда картинке верим,
+        // пока расхождение не станет явным срывом (втрое больше порога)
+        const tol = fid && fid.stats.markers >= 3 ? COMBOTOL : COMBOTOL * 3;
+        if (d > tol) { poseFromAruco = true; comboStats.aruco++; return copyA(); }
+        poseFromAruco = false; comboStats.mind++;
+        return r;
+      };
+    }
     if (DEDUP) {
       const tu = ctrl._trackAndUpdate.bind(ctrl), dm = ctrl._detectAndMatch.bind(ctrl);
       ctrl._trackAndUpdate = (inp, M, i) => (curDup ? Promise.resolve(M) : tu(inp, M, i));            // тот же кадр — та же поза
@@ -234,7 +257,7 @@ export function createTracker(opts) {
       // MindAR сначала рисует кадр на свой холст; поиск метки начнётся уже после возврата отсюда,
       // поэтому подсказку (позу потока) можно поставить и после — а кадр взять готовым с его холста
       const res = orig(input);
-      if (ARUCO && isNew) fidFrame(loader.context && loader.context.canvas);
+      if (FID && isNew) fidFrame(loader.context && loader.context.canvas);
       if (isNew && hy && hyTurn()) hySafe(() => hybridFrame(loader.context && loader.context.canvas));
       else hyValid = false;
       if (PREDICT && !hyValid && !ARUCO) predictPose();
@@ -312,6 +335,13 @@ export function createTracker(opts) {
     r1 = u.map((v, i) => (v + w[i]) / Math.SQRT2); r2 = u.map((v, i) => (v - w[i]) / Math.SQRT2);
     const r3 = [r1[1] * r2[2] - r1[2] * r2[1], r1[2] * r2[0] - r1[0] * r2[2], r1[0] * r2[1] - r1[1] * r2[0]];
     return [0, 1, 2].map((i) => [r1[i], r2[i], r3[i], t[i]]);
+  }
+  function poseDiff(M1, M2) {
+    const a = MtoH(M1), b = MtoH(M2), [w, h] = markerDims();
+    const pr = (H, x, y) => { const z = H[6] * x + H[7] * y + H[8]; return [(H[0] * x + H[1] * y + H[2]) / z, (H[3] * x + H[4] * y + H[5]) / z]; };
+    let sum = 0;
+    for (const [x, y] of [[0, 0], [w, 0], [w, h], [0, h], [w / 2, h / 2]]) { const p = pr(a, x, y), q = pr(b, x, y); sum += Math.hypot(p[0] - q[0], p[1] - q[1]); }
+    return sum / 5;
   }
   function setAnchorFromM(M) {
     hyM4.fromArray(mindar.controller._glModelViewMatrix(M, 0)).multiply(mindar.postMatrixs[0]);
@@ -391,10 +421,15 @@ export function createTracker(opts) {
   // Распознаватель меток (js/fiducial.js) подгружается только в этом режиме. Поиск MindAR подменяется:
   // поза на кадре — результат распознавания листа (гомография по всем видимым углам → поза).
   // Всё остальное (гироскоп, сглаживание, удержание, синхронизация) работает как обычно.
-  const ARUCO = MARKER === 'aruco';
+  const ARUCO = MARKER === 'aruco', COMBO = MARKER === 'combo', FID = ARUCO || COMBO;
+  let poseFromAruco = false;
+  const comboStats = { mind: 0, aruco: 0, diff: 0 };
   const qRawC = new THREE.Quaternion(), qTmpC = new THREE.Quaternion(), pCen = new THREE.Vector3(), offC = new THREE.Vector3();
   let fid = null, arucoM = null;
-  if (ARUCO) import('./fiducial.js?v=' + BUILDV).then((m) => { m.setBoard(BOARDN); fid = m.createFiducial(); console.log('[метка] режим: лист квадратных меток ' + BOARDN + '×' + BOARDN); })
+  if (FID) import('./fiducial.js?v=' + BUILDV).then((m) => {
+    m.setBoard(COMBO ? 'combo' : BOARDN); fid = m.createFiducial();
+    console.log('[метка] режим:', COMBO ? 'картинка + 6 квадратных меток' : 'лист квадратных меток ' + BOARDN + '×' + BOARDN);
+  })
     .catch((e) => console.error('[метка] распознаватель не загрузился:', e));
   function fidFrame(src) {
     arucoM = null;
@@ -569,7 +604,7 @@ export function createTracker(opts) {
         // Лист меток: вблизи видны 1–2 метки сбоку, и центр листа (где висит Земля) достраивается «рычагом»,
         // который раскачивает любая неточность наклона. Берём из камеры только положение видимых углов,
         // а до центра листа доходим по точному повороту из гироскопа.
-        if (ARUCO && ARCEN && fid && arucoM && fid.stats.cx !== undefined) {
+        if ((ARUCO || (COMBO && poseFromAruco)) && ARCEN && fid && arucoM && fid.stats.cx !== undefined) {
           const M = arucoM, X = fid.stats.cx, Y = fid.stats.cy;
           // видимый центр углов в камере three.js (оси MindAR: y вниз, z вперёд → у нас y вверх, z назад)
           pCen.set(M[0][0] * X + M[0][1] * Y + M[0][3], -(M[1][0] * X + M[1][1] * Y + M[1][3]), -(M[2][0] * X + M[2][1] * Y + M[2][3]));
@@ -662,7 +697,8 @@ export function createTracker(opts) {
       vzF += alpha(DC, dt) * (Math.abs(dist - sDist) / sDist / dt - vzF);       // доля расстояния в секунду
       wF  += alpha(DC, dt) * (2 * Math.acos(Math.min(1, Math.abs(sQ.dot(aQ)))) / dt - wF);
       // лист меток: много меток — поза точная, сглаживаем слабо; 1–2 метки — сильнее (иначе вблизи трясётся)
-      const few = ARUCO && fid && fid.stats.markers <= 2;
+      // (комбо: поза от MindAR по картинке — сглаживаем умеренно, как «мало меток»)
+      const few = (ARUCO && fid && fid.stats.markers <= 2) || (COMBO && !(poseFromAruco && fid && fid.stats.markers >= 3));
       const pmc = few ? Math.min(PMC, 3) : PMC, pb = few ? Math.min(PB, 6) : PB, dmc = few ? Math.min(DMC, 1.2) : DMC, db = few ? Math.min(DB, 3) : DB;
       sDir.lerp(tDir, alpha(pmc + pb * vdF, dt)).normalize();
       const az = alpha(dmc + db * vzF, dt);
@@ -998,7 +1034,7 @@ export function createTracker(opts) {
     },
     get frozen() { return frozen; },
     get loops() { return loopRuns; },
-    get fiducial() { return fid ? { on: true, ...fid.stats, found: !!arucoM } : { on: ARUCO, loading: ARUCO }; },
+    get fiducial() { return fid ? { on: true, ...fid.stats, found: !!arucoM, combo: COMBO ? { ...comboStats, fromAruco: poseFromAruco } : null } : { on: FID, loading: FID }; },
     get camMode() { return { fps: camFps, search: searchR, ev: evSet }; },
     // самые длинные паузы с прошлого вызова, мс
     takeGaps() { const g = { pose: gaps.pose, proc: gaps.proc }; gaps.pose = gaps.proc = 0; return g; },

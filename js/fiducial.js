@@ -13,15 +13,28 @@ import jsfeat from './vendor/jsfeat.mjs';
 
 // 3×3 — метки 5 см (по умолчанию): вблизи в кадре остаётся несколько меток;
 // 2×2 — метки 8 см (?board=2): на тестах лучше переносили смаз, но на телефоне вблизи терялись. Листы разные.
+// combo — комбинированный лист: в центре картинка MindAR (150 мм), сверху и снизу по 3 метки (45 мм, в 8 мм от картинки).
+// Координаты combo — в долях ширины картинки от её левого верхнего угла (abs: true).
+const CMB = (() => {
+  const W = 150, m = 45, gap = 8, xs = [-15, 52.5, 120], rows = [-(gap + m), W + gap];
+  const list = [];
+  rows.forEach((y, r) => xs.forEach((x, c) => list.push({ id: r * 3 + c, x: x / W, y: y / W, s: m / W })));
+  return list;
+})();
 export const BOARDS = {
   2: { cols: 2, rows: 2, s: 0.45, g: 0.10, firstId: 0 },
   3: { cols: 3, rows: 3, s: 0.28, g: 0.08, firstId: 0 },
+  combo: { abs: true, list: CMB, cols: 6, rows: 1 },
 };
 export let BOARD = BOARDS[3];
 export function setBoard(n) { BOARD = BOARDS[n] || BOARDS[3]; return BOARD; }
 
 // углы метки id на листе (TL, TR, BR, BL) в долях ширины листа, или null, если такой метки на листе нет
 export function boardCorners(id) {
+  if (BOARD.abs) {
+    const m = BOARD.list.find((q) => q.id === id);
+    return m ? [[m.x, m.y], [m.x + m.s, m.y], [m.x + m.s, m.y + m.s], [m.x, m.y + m.s]] : null;
+  }
   const k = id - BOARD.firstId;
   if (k < 0 || k >= BOARD.cols * BOARD.rows) return null;
   const c = k % BOARD.cols, r = Math.floor(k / BOARD.cols), x = c * (BOARD.s + BOARD.g), y = r * (BOARD.s + BOARD.g), s = BOARD.s;
@@ -116,8 +129,8 @@ export function createFiducial() {
         for (let i = 0; i < 4; i++) {
           // угол контура — центр крайнего чёрного пикселя; край чёрного квадрата — на полпикселя наружу
           const [sx, sy] = subpix(m.corners[i].x * k + (k - 1) * 0.5, m.corners[i].y * k + (k - 1) * 0.5);
-          from[n].x = markerW / 2 + (bc[i][0] - 0.5) * markerW;
-          from[n].y = markerH / 2 + (bc[i][1] - 0.5) * markerW;
+          if (BOARD.abs) { from[n].x = bc[i][0] * markerW; from[n].y = bc[i][1] * markerW; }   // от угла картинки
+          else { from[n].x = markerW / 2 + (bc[i][0] - 0.5) * markerW; from[n].y = markerH / 2 + (bc[i][1] - 0.5) * markerW; }
           to[n].x = sx; to[n].y = sy; n++;
         }
       }
