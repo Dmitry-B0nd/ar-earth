@@ -6,7 +6,7 @@ import { MindARThree } from 'mindar-image-three';
 
 export function createTracker(opts) {
   const { container, markerUrl, CF, BETA, MISS, WARM, SYNC, RAW, JUMP, NOGUARD, onFound, onLost, onStall, onFatal,
-          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60, JERK = 1, JERKA = 10, JERKW = 200, HYBRID = 0, HYAGREE = 6, HYOVR = 0, HYBUDGET = 8, BUILDV = '0', DEDUP = 1, SEARCH = 0, EV = 0, LIVE = 0, LIVELAG = 40, PREDSMOOTH = 1,
+          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60, JERK = 1, JERKA = 10, JERKW = 200, HYBRID = 0, HYAGREE = 6, HYOVR = 0, HYBUDGET = 8, BUILDV = '0', DEDUP = 1, SEARCH = 0, EV = 0, LIVE = 0, LIVELAG = 40, PREDSMOOTH = 1, PREDV = 0,
           PMC = 2, PB = 5, DMC = 0.6, DB = 2, RMC, RB, DC = 1, FOV = 66 } = opts;
 
   // MindAR просит у камеры только «заднюю камеру» — iPhone тогда снимает 30 кадров/с.
@@ -149,6 +149,26 @@ export function createTracker(opts) {
   // Теперь на повторном кадре поиск метки пропускается — слабому телефону вдвое легче. А освободившееся
   // время тратим на более широкую зону поиска: при 30 к/с метка между кадрами смещается вдвое дальше.
   let curDup = false, lastNewT = 0, camFps = 0, searchR = 10, evSet = null;
+  function setSearch(r) {
+    if (r === searchR && globalThis.__MINDAR_SEARCH === r) return;
+    searchR = r; globalThis.__MINDAR_SEARCH = r;
+    const ctrl = mindar.controller;
+    if (ctrl && ctrl.tracker && ctrl.tracker.kernelCaches) ctrl.tracker.kernelCaches.computeMatching = undefined;   // пересобрать под новую зону
+  }
+  // Зона поиска зависит не от частоты камеры, а от того, сколько кадров распознаватель реально успевает:
+  // камера может давать 60 к/с, а слабый телефон обрабатывает 10–20 — метка между обработанными кадрами
+  // смещается в 3–6 раз дальше. Меряем раз в 2 с; расширяем один раз (сужать обратно не будем — без дёрганий).
+  let rateFrames = 0, rateT = 0, slowSecs = 0;
+  function checkProcRate(now) {
+    if (SEARCH || searchR >= 15) return;
+    if (!rateT) { rateT = now; rateFrames = newProcessed; return; }
+    if (now - rateT < 2000) return;
+    const rate = (newProcessed - rateFrames) * 1000 / (now - rateT);
+    rateT = now; rateFrames = newProcessed;
+    if (rate > 0 && rate < 40) { if (++slowSecs >= 2) { setSearch(15); console.log('[камера] распознаватель успевает ' + rate.toFixed(0) + ' кадров/с — зона поиска ±15 px'); } }
+    else slowSecs = 0;
+  }
+  let newProcessed = 0;
   function setupCameraMode() {
     const ctrl = mindar.controller;
     if (!ctrl || ctrl.__camMode) return;
@@ -156,9 +176,7 @@ export function createTracker(opts) {
     const v = mindar.video, trk = v && v.srcObject && v.srcObject.getVideoTracks()[0];
     const st = trk && trk.getSettings ? trk.getSettings() : {};
     camFps = st.frameRate || 0;
-    searchR = SEARCH || (camFps && camFps <= 40 ? 15 : 10);
-    globalThis.__MINDAR_SEARCH = searchR;
-    if (ctrl.tracker && ctrl.tracker.kernelCaches) ctrl.tracker.kernelCaches.computeMatching = undefined;   // пересобрать под новую зону
+    setSearch(SEARCH || (camFps && camFps <= 40 ? 15 : 10));
     if (DEDUP) {
       const tu = ctrl._trackAndUpdate.bind(ctrl), dm = ctrl._detectAndMatch.bind(ctrl);
       ctrl._trackAndUpdate = (inp, M, i) => (curDup ? Promise.resolve(M) : tu(inp, M, i));            // тот же кадр — та же поза
@@ -451,7 +469,11 @@ export function createTracker(opts) {
   const uStart = new THREE.Vector3(), uNow = new THREE.Vector3();
   let lastGood = -1e9, tGoodFrame = 0, tPrevFrame = 0, havePrev = false, frameUpdated = false, frameT = 0;
   let coasting = false, coastOk = false;
-  const VMAX = 0.0025;                       // предел скорости метки «по комнате» для продолжения, рад/мс
+  // Предел скорости метки «по комнате» для продолжения, рад/мс (≈ 46°/с), и затухание продолжения:
+  // скорость оценивается по камере, а на смазанном кадре бывает сильно завышена — тогда сцена «уезжала».
+  // С затуханием (τ = 150 мс) продолжение за всё удержание — не больше ~7°.
+  const VMAX = 0.0008, VTAU = 150;
+  const vDecay = (d) => VTAU * (1 - Math.exp(-Math.max(0, d) / VTAU));
 
   let frozen = false, frozenWant = false;
   anchor.onTargetUpdate = () => {
@@ -592,7 +614,8 @@ export function createTracker(opts) {
       if (fusedNow && havePoseQ && havePrevQ && PREDSMOOTH) {
         const dtf = Math.min(200, Math.max(0, tPoseFrame - tPrevPose));
         qDp.copy(qWCpose).invert().multiply(qWCprev);                         // камера прошлого кадра → этого
-        uL.copy(sDir).applyQuaternion(qWCprev).addScaledVector(vW, dtf).normalize();
+        uL.copy(sDir).applyQuaternion(qWCprev);
+        if (PREDV) uL.addScaledVector(vW, dtf).normalize();                     // (сдвиг по скорости — только по ?predv=1)
         sDir.copy(uL).applyQuaternion(qL.copy(qWCpose).invert());
         sQ.premultiply(qDp);
       }
@@ -617,7 +640,7 @@ export function createTracker(opts) {
     const since = performance.now() - lastGood;
     if (!(fusedNow && ready && haveMW && imu && imu.fresh()) || since > COAST_MS + FADE_MS) return (coastOk = false);
     if (!coasting) { uStart.copy(sDir).applyQuaternion(qWCgood); coasting = true; }   // откуда продолжаем
-    const d = Math.max(0, tNow - tGoodFrame);
+    const d = vDecay(tNow - tGoodFrame);
     uNow.copy(vW).multiplyScalar(d).add(uStart).normalize();
     qCW.copy(qWCnow).invert();
     proj.copy(uNow).applyQuaternion(qCW).multiplyScalar(sDist);
@@ -647,7 +670,7 @@ export function createTracker(opts) {
     if (now - lastGood > COAST_MS + FADE_MS) return;
     imu.worldFromCamera(qNowL, LIVELAG);
     const d = Math.min(300, Math.max(0, (now - LIVELAG) - tPoseFrame));
-    uL.copy(sDir).applyQuaternion(qWCpose).addScaledVector(vW, d).normalize();   // направление на метку «в комнате»
+    uL.copy(sDir).applyQuaternion(qWCpose).addScaledVector(vW, vDecay(d)).normalize();   // направление на метку «в комнате»
     qL.copy(qNowL).invert();
     pL.copy(uL).applyQuaternion(qL).multiplyScalar(sDist);
     qL.multiply(qWCpose).multiply(sQ);                                          // поворот: тот же путь через «комнату»
@@ -705,6 +728,8 @@ export function createTracker(opts) {
     ctrl.onUpdate = (data) => {
       if (data.type === 'processDone') {
         lastProcessed = realProcessed = performance.now(); loopRuns++;
+        { const tsx = ctrl.trackingStates && ctrl.trackingStates[0];          // скорость меряем, только пока метку ведём
+          if (tsx && tsx.isTracking) { if (!curDup) { newProcessed++; checkProcRate(realProcessed); } } else rateT = 0; }
         if (gaps.lastProc) gaps.proc = Math.max(gaps.proc, realProcessed - gaps.lastProc); gaps.lastProc = realProcessed;
         // кадр обработан, а позы нет (смаз, перезахват) — поворачиваем сцену по гироскопу этого кадра
         if (!curDup) {

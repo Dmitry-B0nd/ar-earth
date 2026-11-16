@@ -218,13 +218,13 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=4.21';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=4.21';
-import { createImu } from './js/imu.js?v=4.21';
-import { createViewer3D } from './js/viewer3d.js?v=4.21';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=4.21';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.21';
-const BUILD = '4.21';
+import { createTracker } from './js/tracking.js?v=4.22';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=4.22';
+import { createImu } from './js/imu.js?v=4.22';
+import { createViewer3D } from './js/viewer3d.js?v=4.22';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=4.22';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.22';
+const BUILD = '4.22';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -264,7 +264,7 @@ const P = {
   // живой режим: видео напрямую, поза сцены каждый кадр по гироскопу (live=1); livelag — задержка видео, мс
   LIVE: num('live', 0), LIVELAG: num('livelag', 40),
   // прогноз позы по гироскопу перед сглаживанием (predsmooth=0 — как раньше)
-  PREDSMOOTH: num('predsmooth', 1),
+  PREDSMOOTH: num('predsmooth', 1), PREDV: num('predv', 0),
   // сцена
   SPEED: q.has('speed') ? num('speed') : null,   // ускорение времени; без параметра — из настроек «Вид» (по умолчанию ×120)
   R: num('r', 0.45),                   // радиус Земли (в ширинах метки)
