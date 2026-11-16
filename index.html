@@ -218,13 +218,13 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=4.28';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=4.28';
-import { createImu } from './js/imu.js?v=4.28';
-import { createViewer3D } from './js/viewer3d.js?v=4.28';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=4.28';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.28';
-const BUILD = '4.28';
+import { createTracker } from './js/tracking.js?v=4.29';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=4.29';
+import { createImu } from './js/imu.js?v=4.29';
+import { createViewer3D } from './js/viewer3d.js?v=4.29';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=4.29';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.29';
+const BUILD = '4.29';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -235,7 +235,8 @@ console.log('[0] Библиотеки загружены через', sec());
 const q = new URLSearchParams(location.search);
 const num = (k, d) => parseFloat(q.get(k) ?? d);
 // калибровка «камера ↔ гироскоп», сохранённая на этом телефоне (угол обзора, задержка кадра); ?calib=0 — не применять
-const CAL = (() => { try { return q.get('calib') === '0' ? {} : (JSON.parse(localStorage.getItem('ar-earth-cal') || '{}') || {}); } catch (e) { return {}; } })();
+// (по умолчанию выключено: на телефонах не помогло, а пересчёт раз в 2 с давал просадки FPS на старом телефоне; ?calib=1 — включить)
+const CAL = (() => { try { return q.get('calib') !== '1' ? {} : (JSON.parse(localStorage.getItem('ar-earth-cal') || '{}') || {}); } catch (e) { return {}; } })();
 const P = {
   // трекинг (подобрано в День 1)
   CF: num('cf', 1), BETA: num('beta', 0),
@@ -265,7 +266,7 @@ const P = {
   HYOVR: num('hyovr', 0),
   JERK: num('jerk', 1), JERKA: num('jerka', 10), JERKW: num('jerkw', 200),
   // угол обзора камеры телефона по длинной стороне кадра, градусы (0 = как в MindAR по умолчанию, 45°)
-  FOV: num('fov', CAL.fov ?? 66), CALIB: num('calib', 1),
+  FOV: num('fov', CAL.fov ?? 66), CALIB: num('calib', 0),
   onCalib: (c) => { try { localStorage.setItem('ar-earth-cal', JSON.stringify({ ...c, at: new Date().toISOString() })); } catch (e) {} },
   RAW: q.get('raw') === '1', JUMP: num('jump', 25), NOGUARD: q.get('noguard') === '1',
   MISS: parseInt(q.get('miss') ?? '2'), WARM: parseInt(q.get('warm') ?? '2'), SYNC: q.get('sync') !== '0' && q.get('live') !== '1',
