@@ -62,7 +62,10 @@ export function createSensors() {
       if (on > 1) {
         const k0 = (oi - 1 + N) % N, dt = ot[oi] - ot[k0];
         if (dt > 0 && dt < 100) {
-          const ex = Math.min(t - ot[oi], 50) / dt;
+          // (на слабом телефоне события датчиков бывают «в пути» дольше кадра — без продолжения сцена на миг
+          // «прилипала» бы к камере)
+          const ex = Math.min(t - ot[oi], 110) / dt;
+          diag.extra = Math.max(diag.extra || 0, t - ot[oi]);
           load(k0, qa); qb.copy(qa).invert().multiply(out);       // поворот за последний шаг (в осях телефона)
           qa.identity().slerp(qb, ex);
           out.multiply(qa);

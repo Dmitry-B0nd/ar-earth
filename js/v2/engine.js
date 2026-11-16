@@ -10,15 +10,15 @@
 //  • Задержка кадра и угол обзора камеры подбираются сами, по ходу (без перезагрузки).
 // Наружу — тот же набор, что у первого движка: renderer, scene, camera, content (ширина листа = 1, Z — вверх от листа).
 import * as THREE from 'three';
-import { createSensors } from './sensors.js?v=5.0';
-import { createFusion } from './fusion.js?v=5.0';
+import { createSensors } from './sensors.js?v=5.1';
+import { createFusion } from './fusion.js?v=5.1';
 
-const VER = '5.0';
-const CAL_KEY = 'ar-earth-v2-cal';
+const VER = '5.1';
+const CAL_KEY = 'ar-earth-v2-cal-5.1';   // новая версия подбора обзора — старые (смещённые) значения не берём
 
 export function createEngine2(opts) {
   const { container, onFound, onLost, onStall, FOV = 66, CAMFPS = 60, MAXPIX = 76800, BOARDM = 0.18, BG = 'gl',
-    SKIPBLUR = 30, KEEP = 8000, LAG = null, SMOOTHCLK = false, GRAB = 'pixels', AA = true, AUTOCAL = true, NATIVELAG = 60 } = opts;
+    SKIPBLUR = 30, KEEP = 8000, TT0 = 0, BUDGET = 14, LAG = null, SMOOTHCLK = false, GRAB = 'pixels', AA = true, AUTOCAL = true, NATIVELAG = 60 } = opts;
 
   // ---------- Рисование ----------
   const renderer = new THREE.WebGLRenderer({ antialias: AA, alpha: BG === 'native', powerPreference: 'default' });
@@ -72,7 +72,7 @@ export function createEngine2(opts) {
   const grabCtx = grabCv.getContext('2d', { willReadFrequently: true });
   const freeBufs = [];
   let grabMode = GRAB;               // 'pixels' — читаем пиксели здесь; 'bitmap' — картинку отдаём потоку
-  let searchFlip = 0;
+  let searchFlip = 0, lastGrabMs = 0;
 
   function startVision() {
     try {
@@ -98,7 +98,20 @@ export function createEngine2(opts) {
   }
 
   // какой участок кадра смотреть и в каком масштабе
-  const TARGET_TAG = 22;              // сторона метки на уменьшенном участке, пиксели (достаточно для чтения кода)
+  // Сторона метки на уменьшенном участке, пиксели. 22 — хватает, чтобы прочитать код, но углы точнее при большей:
+  // вблизи участок сильно уменьшается, и шум углов в пикселях видео растёт — сцена дрожит.
+  // Поэтому чёткость подстраивается под телефон: успевает быстро — смотрим подробнее (до 44), не успевает — грубее (до 18).
+  let TARGET_TAG = TT0 || 26;
+  const qual = { t: performance.now(), ms: 0, n: 0 };
+  function adaptQuality(ms) {
+    qual.ms += ms; qual.n++;
+    const now = performance.now();
+    if (now - qual.t < 1000 || qual.n < 3) return;
+    const avg = qual.ms / qual.n; qual.ms = 0; qual.n = 0; qual.t = now;
+    if (TT0) return;
+    if (avg < BUDGET * 0.55 && TARGET_TAG < 44) TARGET_TAG += 3;
+    else if (avg > BUDGET && TARGET_TAG > 18) TARGET_TAG -= 3;
+  }
   function planRoi(tf) {
     let sx = 0, sy = 0, sw = vw, sh = vh, scale;
     const tracking = fusion.st.init && performance.now() - fusion.st.lastMeas < 600;
@@ -120,7 +133,7 @@ export function createEngine2(opts) {
     }
     scale = Math.min(scale, 1);
     let dw = Math.max(32, Math.round(sw * scale)), dh = Math.max(32, Math.round(sh * scale));
-    const cap = pc ? MAXPIX : MAXPIX * 2.25;
+    const cap = pc ? Math.min(MAXPIX * (TARGET_TAG / 22) ** 2, 230000) : MAXPIX * 2.25;
     if (dw * dh > cap) { const k = Math.sqrt(cap / (dw * dh)); dw = Math.max(32, Math.round(dw * k)); dh = Math.max(32, Math.round(dh * k)); }
     return { sx, sy, sw, sh, dw, dh };
   }
@@ -131,7 +144,7 @@ export function createEngine2(opts) {
     // сильный смаз (телефон резко поворачивают): кадр всё равно не распознается — не тратим силы,
     // сцену в это время держит гироскоп
     if (fusion.st.init && sensors.hasOrientation) {
-      const blur = sensors.rateAt(tf - fusion.lag) * 0.012 * fusion.f;
+      const blur = sensors.rateAt(tf - fusion.lag) * 0.016 * fusion.f;
       if (blur > SKIPBLUR && performance.now() - fusion.st.lastMeas < 1500) { sec.blurSkip++; return; }
     }
     const r = planRoi(tf);
@@ -142,7 +155,7 @@ export function createEngine2(opts) {
     const t0 = performance.now();
     if (grabMode === 'bitmap' && worker) {
       createImageBitmap(video, r.sx, r.sy, r.sw, r.sh, { resizeWidth: r.dw, resizeHeight: r.dh, resizeQuality: 'low' }).then((bmp) => {
-        sec.grabMs += performance.now() - t0;
+        lastGrabMs = 0; sec.grabMs += performance.now() - t0;
         worker.postMessage({ type: 'frame', id, tFrame: tf, w: r.dw, h: r.dh, map, bitmap: bmp }, [bmp]);
         sec.sent++;
       }).catch((e) => { console.warn('[движок 2] картинка кадра не получилась — читаю пиксели сам:', e); grabMode = 'pixels'; busy = false; });
@@ -151,7 +164,8 @@ export function createEngine2(opts) {
     if (grabCv.width !== r.dw || grabCv.height !== r.dh) { grabCv.width = r.dw; grabCv.height = r.dh; }
     grabCtx.drawImage(video, r.sx, r.sy, r.sw, r.sh, 0, 0, r.dw, r.dh);
     const img = grabCtx.getImageData(0, 0, r.dw, r.dh);
-    sec.grabMs += performance.now() - t0;
+    lastGrabMs = performance.now() - t0;
+    sec.grabMs += lastGrabMs;
     sec.sent++;
     if (worker && workerOk) {
       worker.postMessage({ type: 'frame', id, tFrame: tf, w: r.dw, h: r.dh, map, data: img.data }, [img.data.buffer]);
@@ -173,6 +187,7 @@ export function createEngine2(opts) {
     const now = performance.now();
     visionLoops++; sec.res++;
     sec.procMs += m.ms; sec.readMs += m.readMs || 0;
+    adaptQuality(m.ms + lastGrabMs);
     if (gaps.lastProc) gaps.proc = Math.max(gaps.proc, now - gaps.lastProc);
     gaps.lastProc = now;
     sec.tags = m.tags; sec.side = m.side; sec.err = m.err || 0;
@@ -368,15 +383,19 @@ export function createEngine2(opts) {
     const F = fusion.st, sd = sensors.diag, c = F.calib;
     const fname = { 'acc+': 'с акселерометром', 'acc-': 'с акселерометром (обр. знак)', cv: 'по скорости', hold: 'на месте' }[F.filt] || F.filt;
     const per = (v) => (v / dt).toFixed(0);
+    // средний «скачок» поправки за секунду, пиксели видео (до плавного растворения) — мерило дрожи от распознавания
+    const corr = F.diag.corrN ? (F.diag.corr / F.diag.corrN).toFixed(1) + ' px' : '—';
+    F.diag.corr = 0; F.diag.corrN = 0;
+    const ext = sd.extra || 0; sd.extra = 0;
     const tags = sec.tags ? `меток ${sec.tags} (сторона ${sec.side.toFixed(0)} px)` : 'меток 0';
     return `движок 2  камера ${vw}×${vh} ${fr ? Math.round(fr) + ' к/с' : ''}, новых ${per(d.frames)}/с (время ${vf.mode})\n` +
       `поиск ${per(d.res)}/с: ${d.res ? (d.procMs / d.res).toFixed(1) : '—'} мс ${worker && workerOk ? 'в фоне' : 'в основном потоке'}` +
       ` + захват ${d.sent ? (d.grabMs / d.sent).toFixed(1) : '—'} мс\n` +
-      `  ${sec.roi}  ${tags}  нашёл ${per(d.found)}/с  смаз-пропуск ${d.blurSkip}${d.fails ? '  сбоев ' + d.fails : ''}\n` +
-      `сдвиг: ${fname}  отсев ${F.diag.rej}  сбросов ${F.resets}  рассогл. ${F.diag.inconsist}\n` +
+      `  ${sec.roi} (чёткость ${TARGET_TAG})  ${tags}  нашёл ${per(d.found)}/с  смаз: пропуск ${d.blurSkip} отказ ${F.diag.blurRej}${d.fails ? '  сбоев ' + d.fails : ''}\n` +
+      `сдвиг: ${fname}  отсев ${F.diag.rej}  сбросов ${F.resets}  рассогл. ${F.diag.inconsist}  поправки ${corr}\n` +
       `  промахи ${Object.entries(F.diag.nis).map(([k, v]) => k + ' ' + v.toFixed(1)).join('  ')}\n` +
       `калибр.: задержка ${fusion.lag.toFixed(0)} мс  обзор ${fusion.fov.toFixed(1)}°  (подборов ${c.lagRuns}/${c.fRuns}${c.spread != null ? ', разброс ' + c.spread.toFixed(2) + '°' : ''})\n` +
-      `датчики (${sensors.source}): ориент. ${sd.rel}/${sd.relNull} комп. ${sd.abs} движ. ${sd.mot} уск. ${sd.acc}  знак g ${fusion.gSign > 0 ? '+' : fusion.gSign < 0 ? '−' : '?'}${sd.late ? '  опозд. ' + sd.late : ''}\n` +
+      `датчики (${sensors.source}): ориент. ${sd.rel}/${sd.relNull} комп. ${sd.abs} движ. ${sd.mot} уск. ${sd.acc}  знак g ${fusion.gSign > 0 ? '+' : fusion.gSign < 0 ? '−' : '?'}${sd.late ? '  опозд. ' + sd.late : ''}  запаздывание до ${ext.toFixed(0)} мс\n` +
       `лист: ${markerState()}  смаз ${F.diag.blur.toFixed(0)} px  ошибка углов ${sec.err.toFixed(2)} px\n`;
   }
   function markerState() {
