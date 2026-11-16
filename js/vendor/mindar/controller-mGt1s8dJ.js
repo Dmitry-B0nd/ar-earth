@@ -52603,7 +52603,7 @@ class Q5 {
     }), i.dispose(), u.dispose(), d.dispose(), h.dispose(), { worldCoords: g, screenCoords: b, debugExtra: o };
   }
   _computeMatching(t, e, s, o) {
-    const r = Z5, i = r * 2 + 1, l = H5 * B5, c = _5, u = l * 2 + 1, d = o.shape[0], h = o.shape[1], p = t.shape[0];
+    const r = Z5, i = r * 2 + 1, l = (globalThis.__MINDAR_SEARCH || H5) * B5 /* AR-Earth: зону поиска задаёт tracking.js */, c = _5, u = l * 2 + 1, d = o.shape[0], h = o.shape[1], p = t.shape[0];
     if (!this.kernelCaches.computeMatching) {
       const f = {
         variableNames: ["features", "markerPixels", "markerProperties", "targetPixels"],

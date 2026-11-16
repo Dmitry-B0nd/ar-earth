@@ -218,13 +218,13 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=4.18';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=4.18';
-import { createImu } from './js/imu.js?v=4.18';
-import { createViewer3D } from './js/viewer3d.js?v=4.18';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=4.18';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.18';
-const BUILD = '4.18';
+import { createTracker } from './js/tracking.js?v=4.20';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=4.20';
+import { createImu } from './js/imu.js?v=4.20';
+import { createViewer3D } from './js/viewer3d.js?v=4.20';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=4.20';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=4.20';
+const BUILD = '4.20';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -250,7 +250,10 @@ const P = {
   CAMFPS: num('camfps', 60),
   // рывок: при ускорении > jerka м/с² или повороте > jerkw °/с сцену быстро гасим и ищем метку заново (jerk=0 — выключить)
   // гибридный трекер (экспериментальная ветка): оптический поток в помощь MindAR; hybrid=0 — как в 4.14
-  HYBRID: num('hybrid', 0), HYAGREE: num('hyagree', 6), HYBUDGET: num('hybudget', 8),
+  // камера 30 к/с: dedup=0 — обрабатывать повторные кадры; search — зона поиска MindAR (0 — авто: 15 при 30 к/с, 10 при 60);
+  // ev — поправка экспозиции (например -1: короче выдержка, меньше смаз; только Android)
+  DEDUP: num('dedup', 1), SEARCH: num('search', 0), EV: num('ev', 0),
+  HYBRID: num('hybrid', 0), HYAGREE: num('hyagree', 6), HYBUDGET: num('hybudget', 8), BUILDV: BUILD,
   // hyovr=1 — поток может перебивать позу MindAR при сильном расхождении (в 5.0h было включено)
   HYOVR: num('hyovr', 0),
   JERK: num('jerk', 1), JERKA: num('jerka', 10), JERKW: num('jerkw', 200),
@@ -691,7 +694,9 @@ async function start(mode) {
   const camLine = () => {
     const v = tracker.mindar.video, trk = v && v.srcObject && v.srcObject.getVideoTracks()[0];
     const fr = trk && trk.getSettings ? trk.getSettings().frameRate : null;
+    const cm = tracker.camMode;
     return `камера ${v ? v.videoWidth + '×' + v.videoHeight : '—'}  ${fr ? Math.round(fr) + ' к/с' : ''}  новых ${tracker.stats.newFrames}\n` +
+      `поиск ±${cm.search}  повторов ${tracker.stats.dups}${cm.ev !== null ? '  эксп. ' + cm.ev : ''}\n` +
       `режим: ${lite.on ? 'лёгкий (' + lite.why + ')' : 'обычный'}  рисование ${lite.fps}\n` + gapLine() + hyLine();
   };
   // самые длинные паузы за секунду: кадр отрисовки / обновление позы сцены / обработка кадра камеры
@@ -703,7 +708,7 @@ async function start(mode) {
   const hyLine = () => {
     const h = tracker.hybrid;
     if (!h.on) return h.level >= 3 ? 'гибрид: выкл (дорого для телефона)\n' : 'гибрид: выкл\n';
-    const lv = ['', '  кадр ⅓', '  ⅓ через кадр'][h.level] || '';
+    const lv = h.level === 1 ? '  через кадр' : '';
     return `гибрид: точек ${h.pts}  ${h.ms.toFixed(1)} мс (кадр ${h.grab.toFixed(1)})${lv}\n  свой ${h.drive}  вернул ${h.revive}  посев ${h.seeds}  расх. ${h.diff.toFixed(1)} px\n`;
   };
   if (window.DEV) setInterval(() => {
@@ -711,7 +716,7 @@ async function start(mode) {
       `время UTC ${fmt(simDate)}  ×${view.speed}\n` +
       (AR ? camLine() + `трекер ${tracker.stats.updates} Гц  отсев ${tracker.stats.rejected}\n` : '') +
       imuLine();
-    if (AR) { const st = tracker.stats; st.updates = 0; st.rejected = 0; st.fused = 0; st.imuAngSum = 0; st.imuN = 0; st.newFrames = 0; }
+    if (AR) { const st = tracker.stats; st.dups = 0; st.updates = 0; st.rejected = 0; st.fused = 0; st.imuAngSum = 0; st.imuN = 0; st.newFrames = 0; }
   }, 1000);
 
   // ---- Горизонтальная ориентация: в AR показываем заставку и ставим распознавание на паузу ----

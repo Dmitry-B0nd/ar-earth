@@ -3,11 +3,10 @@
 // Единицы внутри content: ширина метки = 1, центр метки = (0,0,0), ось Z смотрит от метки вверх.
 import * as THREE from 'three';
 import { MindARThree } from 'mindar-image-three';
-import { createHybrid } from './hybrid.js?v=4.18';
 
 export function createTracker(opts) {
   const { container, markerUrl, CF, BETA, MISS, WARM, SYNC, RAW, JUMP, NOGUARD, onFound, onLost, onStall, onFatal,
-          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60, JERK = 1, JERKA = 10, JERKW = 200, HYBRID = 0, HYAGREE = 6, HYOVR = 0, HYBUDGET = 8,
+          imu, USE_IMU = true, TOL = 20, IMULAG = 0, KMW = 0.03, COAST = 500, PREDICT = 1, CAMFPS = 60, JERK = 1, JERKA = 10, JERKW = 200, HYBRID = 0, HYAGREE = 6, HYOVR = 0, HYBUDGET = 8, BUILDV = '0', DEDUP = 1, SEARCH = 0, EV = 0,
           PMC = 2, PB = 5, DMC = 0.6, DB = 2, RMC, RB, DC = 1, FOV = 66 } = opts;
 
   // MindAR просит у камеры только «заднюю камеру» — iPhone тогда снимает 30 кадров/с.
@@ -145,6 +144,38 @@ export function createTracker(opts) {
   // (а где его нет — по video.currentTime); на повторном кадре время то же, и подсказка трекеру
   // и оценка скорости его не учитывают, а гироскоп берётся на момент появления кадра.
   let vfcT = 0, vfcN = 0, vfcVideo = null, lastFrameId = -1, newFrames = 0;
+  // ---- Камера 30 кадров/с ----
+  // Трекер крутится с частотой экрана (60 раз/с), и при камере на 30 к/с каждый кадр обрабатывал дважды.
+  // Теперь на повторном кадре поиск метки пропускается — слабому телефону вдвое легче. А освободившееся
+  // время тратим на более широкую зону поиска: при 30 к/с метка между кадрами смещается вдвое дальше.
+  let curDup = false, lastNewT = 0, camFps = 0, searchR = 10, evSet = null;
+  function setupCameraMode() {
+    const ctrl = mindar.controller;
+    if (!ctrl || ctrl.__camMode) return;
+    ctrl.__camMode = true;
+    const v = mindar.video, trk = v && v.srcObject && v.srcObject.getVideoTracks()[0];
+    const st = trk && trk.getSettings ? trk.getSettings() : {};
+    camFps = st.frameRate || 0;
+    searchR = SEARCH || (camFps && camFps <= 40 ? 15 : 10);
+    globalThis.__MINDAR_SEARCH = searchR;
+    if (ctrl.tracker && ctrl.tracker.kernelCaches) ctrl.tracker.kernelCaches.computeMatching = undefined;   // пересобрать под новую зону
+    if (DEDUP) {
+      const tu = ctrl._trackAndUpdate.bind(ctrl), dm = ctrl._detectAndMatch.bind(ctrl);
+      ctrl._trackAndUpdate = (inp, M, i) => (curDup ? Promise.resolve(M) : tu(inp, M, i));            // тот же кадр — та же поза
+      ctrl._detectAndMatch = (inp, list) => (curDup ? Promise.resolve({ targetIndex: -1 }) : dm(inp, list));
+    }
+    // короче выдержка — меньше смаз (Android; картинка темнее). ev < 0, например -1
+    if (EV && trk && trk.getCapabilities) {
+      const c = trk.getCapabilities().exposureCompensation;
+      if (c) {
+        const val = Math.max(c.min, Math.min(c.max, EV));
+        trk.applyConstraints({ advanced: [{ exposureCompensation: val }] })
+          .then(() => { evSet = val; console.log('[камера] экспозиция', val); })
+          .catch((e) => console.warn('[камера] экспозицию не изменить:', e));
+      } else console.log('[камера] этот браузер не даёт менять экспозицию');
+    }
+    console.log(`[камера] ${camFps || '?'} к/с — зона поиска ±${searchR} px, повторные кадры ${DEDUP ? 'пропускаем' : 'обрабатываем'}`);
+  }
   // запасной режим без гироскопа: наклон метки на столе — по направлению «вверх» от акселерометра
   const upFrame = new THREE.Vector3(), qFixG = new THREE.Quaternion();
   let haveFrameUp = false, gSign = 1, gFlipVotes = 0, gAngAvg = null, gravMode = false;
@@ -164,7 +195,10 @@ export function createTracker(opts) {
       const now = performance.now(), useVfc = vfcVideo === mindar.video && vfcN > 0;
       const id = useVfc ? vfcN : (mindar.video ? mindar.video.currentTime : 0);
       const isNew = id !== lastFrameId;
-      if (isNew) { lastFrameId = id; newFrames++; frameT = useVfc ? vfcT : now; }
+      if (isNew) { lastFrameId = id; newFrames++; frameT = useVfc ? vfcT : now; lastNewT = now; }
+      // повторный кадр — только если браузер точно сообщает о новых кадрах, и не дольше 100 мс подряд
+      curDup = DEDUP && !isNew && useVfc && now - lastNewT < 100;
+      if (curDup) stats.dups++;
       // на повторном кадре гироскоп не перечитываем — картинка та же
       if (isNew) {
         if (imu && imu.fresh() && imu.hasAlpha) { imu.worldFromCamera(qWCframe, IMULAG + Math.max(0, now - frameT)); haveFrameQ = true; } else haveFrameQ = false;
@@ -190,21 +224,25 @@ export function createTracker(opts) {
   //  • MindAR на кадре сорвался — на экран идёт поза потока; MindAR потерял метку — сразу
   //    возвращаем его в режим слежения с позой потока, без долгого поиска с нуля.
   //  • Когда MindAR и поток согласны — точки потока периодически пересеваем по MindAR (убираем накопленный увод).
-  let hy = HYBRID ? createHybrid() : null;
+  // Код гибрида (и библиотека оптического потока, ~220 КБ) загружается, только если гибрид включён (?hybrid=1):
+  // в основной версии телефону не нужно его скачивать и разбирать.
+  let hy = null, createHybrid = null;
+  if (HYBRID) import('./hybrid.js?v=' + BUILDV).then((m) => { createHybrid = m.createHybrid; hy = createHybrid(); })
+    .catch((e) => console.warn('[гибрид] не загрузился — работаем как обычно:', e));
   // Самоограничение: гибрид не должен тормозить телефон сильнее, чем помогает.
-  // Если в среднем дольше HYBUDGET мс на кадр (1,5 с подряд) — шаг вниз:
-  //   0: копия кадра ½, каждый кадр → 1: копия ~⅓ → 2: ~⅓ через кадр → 3: выключен.
+  // Если в среднем дольше HYBUDGET мс на кадр (1,5 с подряд) — шаг вниз: каждый кадр → через кадр → выключен.
   let hyLevel = 0, hyOverSince = null, hyFrameN = 0;
-  const hyTurn = () => (++hyFrameN, hyLevel < 2 || hyFrameN % 2 === 0);
+  const hyTurn = () => (++hyFrameN, hyLevel < 1 || hyFrameN % 2 === 0);
   function hyBudget(now) {
-    const perFrame = hyLevel >= 2 ? hyStats.ms / 2 : hyStats.ms;      // через кадр — в среднем вдвое дешевле
+    const perFrame = hyLevel >= 1 ? hyStats.ms / 2 : hyStats.ms;      // через кадр — в среднем вдвое дешевле
     if (perFrame <= HYBUDGET) { hyOverSince = null; return; }
     if (hyOverSince === null) { hyOverSince = now; return; }
     if (now - hyOverSince < 1500) return;
     hyOverSince = null; hyLevel++;
-    if (hyLevel === 1) { hy = createHybrid({ scale: 0.34 }); hyStats.ms = HYBUDGET; }
-    if (hyLevel >= 3) { hy = null; hyValid = false; }
-    console.log('[гибрид] дорого для телефона (' + hyStats.ms.toFixed(1) + ' мс) — ' + ['', 'кадр поменьше', 'через кадр', 'выключен'][Math.min(3, hyLevel)]);
+    // ступень 1 — через кадр (на Android дорого само получение кадра, а не его размер: уменьшать кадр бесполезно)
+    if (hyLevel === 1) { hyStats.ms = HYBUDGET; }
+    if (hyLevel >= 2) { hy = null; hyValid = false; hyLevel = 3; }
+    console.log('[гибрид] дорого для телефона (' + hyStats.ms.toFixed(1) + ' мс) — ' + (hyLevel === 1 ? 'через кадр' : 'выключен'));
   }
   // любая ошибка в гибриде не должна ронять распознавание: выключаем гибрид, MindAR работает как обычно
   function hySafe(fn) {
@@ -335,7 +373,7 @@ export function createTracker(opts) {
   // самые длинные паузы за секунду (для отладки «микрофризов»): между обновлениями позы сцены и между обработанными кадрами
   const gaps = { pose: 0, proc: 0, lastPose: 0, lastProc: 0 };
   const markPose = () => { const t = performance.now(); if (gaps.lastPose) gaps.pose = Math.max(gaps.pose, t - gaps.lastPose); gaps.lastPose = t; };
-  const stats = { rejected: 0, updates: 0, fused: 0, imuAngSum: 0, imuN: 0, redetect: 0, coast: 0, pred: 0, jerks: 0, get newFrames() { return newFrames; }, set newFrames(v) { newFrames = v; } };
+  const stats = { dups: 0, rejected: 0, updates: 0, fused: 0, imuAngSum: 0, imuN: 0, redetect: 0, coast: 0, pred: 0, jerks: 0, get newFrames() { return newFrames; }, set newFrames(v) { newFrames = v; } };
 
   // ---- Подсказка трекеру: где метка окажется на следующем кадре ----
   // MindAR ищет каждую точку метки только в ±10 пикселях от того места, где она была на прошлом
@@ -418,6 +456,7 @@ export function createTracker(opts) {
   let frozen = false, frozenWant = false;
   anchor.onTargetUpdate = () => {
     if (frozen) return;                                     // «заморожено»: позу не трогаем
+    if (curDup && !hyDriving) return;                       // тот же кадр, что и прошлый: поза та же
     if (jerkingNow()) return;                               // рывок: позам с камеры не верим
     if (!hyDriving) {                                       // (поза от гибрида проверки MindAR не проходит)
       if (!anchor.group.visible) { accepted = false; suspect = 0; return; }
@@ -626,15 +665,18 @@ export function createTracker(opts) {
   let lastProcessed = performance.now(), realProcessed = performance.now(), loopRuns = 0, restarting = false, stallReported = false;
   function countProcessed() {
     hookFrameImu();
+    setupCameraMode();
     const ctrl = mindar.controller, orig = ctrl.onUpdate;
     ctrl.onUpdate = (data) => {
       if (data.type === 'processDone') {
         lastProcessed = realProcessed = performance.now(); loopRuns++;
         if (gaps.lastProc) gaps.proc = Math.max(gaps.proc, realProcessed - gaps.lastProc); gaps.lastProc = realProcessed;
         // кадр обработан, а позы нет (смаз, перезахват) — поворачиваем сцену по гироскопу этого кадра
-        if (PREDICT) predictLearn();
-        if (hy) hySafe(hybridAfter);
-        if (SYNC && !frozen && !frameUpdated && haveFrameQ) coast(qWCframe, frameT);
+        if (!curDup) {
+          if (PREDICT) predictLearn();
+          if (hy) hySafe(hybridAfter);
+          if (SYNC && !frozen && !frameUpdated && haveFrameQ) coast(qWCframe, frameT);
+        }
       }
       orig(data);
     };
@@ -853,6 +895,7 @@ export function createTracker(opts) {
     },
     get frozen() { return frozen; },
     get loops() { return loopRuns; },
+    get camMode() { return { fps: camFps, search: searchR, ev: evSet }; },
     // самые длинные паузы с прошлого вызова, мс
     takeGaps() { const g = { pose: gaps.pose, proc: gaps.proc }; gaps.pose = gaps.proc = 0; return g; },
     get hybrid() { return hy ? { on: true, level: hyLevel, pts: hy.count, ms: hyStats.ms, grab: hyStats.grab, drive: hyStats.drive, override: hyStats.override, revive: hyStats.revive, diff: hyStats.diff, seeds: hy.stats.seeds } : { on: false, level: HYBRID ? hyLevel : -1 }; },
