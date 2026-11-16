@@ -3,7 +3,7 @@
 // Единицы внутри content: ширина метки = 1, центр метки = (0,0,0), ось Z смотрит от метки вверх.
 import * as THREE from 'three';
 import { MindARThree } from 'mindar-image-three';
-import { createHybrid } from './hybrid.js?v=4.15';
+import { createHybrid } from './hybrid.js?v=4.16';
 
 export function createTracker(opts) {
   const { container, markerUrl, CF, BETA, MISS, WARM, SYNC, RAW, JUMP, NOGUARD, onFound, onLost, onStall, onFatal,
@@ -173,7 +173,7 @@ export function createTracker(opts) {
         if (haveFrameUp) imu.gravityUp(upFrame, gSign);
       }
       frameUpdated = false; hySeedFrom = null;
-      if (isNew && HYBRID) hybridFrame(); else if (!isNew) { hyValid = false; }
+      if (isNew && hy) hySafe(hybridFrame); else if (!isNew) { hyValid = false; }
       if (PREDICT && !hyValid) predictPose();
       return orig(input);
     };
@@ -186,7 +186,14 @@ export function createTracker(opts) {
   //  • MindAR на кадре сорвался — на экран идёт поза потока; MindAR потерял метку — сразу
   //    возвращаем его в режим слежения с позой потока, без долгого поиска с нуля.
   //  • Когда MindAR и поток согласны — точки потока периодически пересеваем по MindAR (убираем накопленный увод).
-  const hy = HYBRID ? createHybrid() : null;
+  let hy = HYBRID ? createHybrid() : null;
+  // любая ошибка в гибриде не должна ронять распознавание: выключаем гибрид, MindAR работает как обычно
+  function hySafe(fn) {
+    try { fn(); } catch (e) {
+      console.error('[гибрид] ошибка — гибрид выключен, работаем как обычно:', e);
+      hy = null; hyValid = false; hyDriving = false;
+    }
+  }
   const hyStats = { ms: 0, drive: 0, override: 0, revive: 0, diff: 0, seedT: 0, disagree: 0 };
   let hyValid = false, hyH = null, hyM = null, hyDriving = false, hyShowUntil = -1e9, hyHoldUntil = -1e9, hySeedFrom = null;
   // Потоку без подтверждения MindAR верим недолго: он может «зацепиться» за фон и уверенно вести не туда.
@@ -391,7 +398,7 @@ export function createTracker(opts) {
       if (!anchor.group.visible) { accepted = false; suspect = 0; return; }
       const ts = mindar.controller && mindar.controller.trackingStates[0];
       if (ts && !ts.isTracking) return;                     // трекер потерял метку и повторяет старую позу
-      if (HYBRID) hybridCheck(ts);                          // MindAR нашёл позу — сверяем с оптическим потоком
+      if (hy) hySafe(() => hybridCheck(ts));               // MindAR нашёл позу — сверяем с оптическим потоком
     }
     stats.updates++;
     anchor.group.matrix.decompose(cPos, cQ, cS);
@@ -599,7 +606,7 @@ export function createTracker(opts) {
         lastProcessed = realProcessed = performance.now(); loopRuns++;
         // кадр обработан, а позы нет (смаз, перезахват) — поворачиваем сцену по гироскопу этого кадра
         if (PREDICT) predictLearn();
-        if (HYBRID) hybridAfter();
+        if (hy) hySafe(hybridAfter);
         if (SYNC && !frozen && !frameUpdated && haveFrameQ) coast(qWCframe, frameT);
       }
       orig(data);
