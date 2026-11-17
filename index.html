@@ -218,14 +218,14 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=6.2';
-import { createEngine2 } from './js/v2/engine.js?v=6.2';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=6.2';
-import { createImu } from './js/imu.js?v=6.2';
-import { createViewer3D } from './js/viewer3d.js?v=6.2';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=6.2';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=6.2';
-const BUILD = '6.2';
+import { createTracker } from './js/tracking.js?v=6.3';
+import { createEngine2 } from './js/v2/engine.js?v=6.3';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=6.3';
+import { createImu } from './js/imu.js?v=6.3';
+import { createViewer3D } from './js/viewer3d.js?v=6.3';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=6.3';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=6.3';
+const BUILD = '6.3';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 

@@ -303,7 +303,7 @@ export function createFusion(opts = {}) {
     alphaQ: 0.35,        // скорость поправки поворота листа
     blendMs: 90,
     sceneH: 0.55,
-    visMode: 'auto', eisOn: 0.9, eisOff: 0.95, eisMinDeg: 5, eisMinN: 10, visBlend: 1, visHF: 0,   // режим «по кадру» для камер со стабилизацией: auto / on / off
+    visMode: 'auto', eisOn: 0.9, eisOff: 0.95, eisMinDeg: 8, eisMinN: 20, eisWarm: 2500, eisHold: 2000, visRampMs: 400, cmpOn: 0.65, cmpOff: 0.85, cmpMinN: 25, visBlend: 1, visHF: 0,   // режим «по кадру» для камер со стабилизацией: auto / on / off
     fovMin: 56, fovMax: 76,   // подбор угла обзора не выходит за эти пределы (у основных камер телефонов ~63–74°)
     euroMin: 0, euroBeta: 20,   // сглаживание положения (0 — выкл.; на тестах не помогло: дрожь руки видна и на видео, её надо повторять, а не сглаживать)        // высота центра сцены над листом (ширины листа)
     lock: 0,             // показ с задержкой: насколько ставить кадр по его собственному распознаванию (0…1)         // поправки на экране — плавно за это время
@@ -499,6 +499,14 @@ export function createFusion(opts = {}) {
     }
 
     const tms = tm / 1000, z = [pW.x, pW.y, pW.z];
+    const hz0 = d.H[6] * 0.5 + d.H[7] * 0.5 + d.H[8];
+    const cU = (d.H[0] * 0.5 + d.H[1] * 0.5 + d.H[2]) / hz0, cV = (d.H[3] * 0.5 + d.H[4] * 0.5 + d.H[5]) / hz0;
+    let gErr = null;
+    if (filters[st.filt].ok && st.init && !reset && d.n >= 16) {
+      filters[st.filt].stateAt(tms, xs);
+      const pc = tv2.set(xs[0], xs[1], xs[2]).applyQuaternion(_qe.copy(qWC).invert());
+      if (pc.z < -0.05) gErr = Math.hypot(st.cx + st.f * pc.x / -pc.z - cU, st.cy - st.f * pc.y / -pc.z - cV);
+    }
     // «снос»: насколько сцена (по прогнозу, без этого распознавания) разошлась с листом на этом кадре, в пикселях
     st.diag.innovPx = null;
     if (filters[st.filt].ok) {
@@ -571,7 +579,7 @@ export function createFusion(opts = {}) {
     const lockW = o.lock * Math.max(0, Math.min(1, (1.8 - sigC) / 1.2)) * (o.fewTags ? Math.min(1, d.n / 16) : 1);
     st.diag.lockW = lockW;
     meas.push({ tf: d.tFrame, tm, z: z.slice(), sl, w: lockW }); if (meas.length > 16) meas.shift();
-    visAdd(d.tFrame, qCM, dec.t, qWC, d.n);
+    visAdd(d.tFrame, qCM, dec.t, qWC, d.n, cU, cV, gErr);
     for (const k in filters) st.diag.nis[k] = filters[k].perr;
     // плавность: разница между старым и новым видом уходит за blendMs
     if (before && st.init && !reset) {
@@ -581,6 +589,7 @@ export function createFusion(opts = {}) {
       st.diag.corr += dP.length() / Math.max(0.3, after.length()) * st.f; st.diag.corrN++;
       qOff.multiply(qBefore.multiply(tq2.copy(st.qMW).invert()));
     } else if (reset) { offP.set(0, 0, 0); qOff.identity(); }
+    if (!st.init && st.initT === Infinity) st.initT = nowf();
     st.init = true; st.lastMeas = nowf(); st.lastMeasFrame = d.tFrame;
     st.diag.n++;
     return { ok: true, reset };
@@ -625,15 +634,38 @@ export function createFusion(opts = {}) {
   // (поворот, в отличие от положения, сдвиги руки не искажают). У iPhone доля ≈ 1,0, у Android со стабилизацией 0,75–0,86.
   // Тогда показываем сцену «по кадру»: между соседними распознаваниями — плавно, а гироскоп — только где распознаваний нет.
   const vis = [], visQ = new THREE.Quaternion(), visP = new THREE.Vector3();
-  const eisS = { gv: 0, gg: 0, n: 0 };
+  const eisS = { gv: 0, gg: 0, n: 0 }; let eisSince = null;
+  st.initT = Infinity; st.eisSince = -1e9; st.visW = 0;
   st.eis = false; st.eisK = 1;
   const _qa = new THREE.Quaternion(), _qb = new THREE.Quaternion(), _qc = new THREE.Quaternion(), _qd = new THREE.Quaternion(), _qe = new THREE.Quaternion(), _va = new THREE.Vector3();
   const rotVec = (q, out) => {          // кватернион → вектор поворота (рад)
     const w = Math.max(-1, Math.min(1, q.w)), s = Math.sqrt(Math.max(0, 1 - w * w)), a = 2 * Math.acos(Math.abs(w)) * (w < 0 ? -1 : 1);
     return s < 1e-9 ? out.set(0, 0, 0) : out.set(q.x / s * a, q.y / s * a, q.z / s * a);
   };
-  function visAdd(tf, qcm, tcv, qwc, n) {
-    const rec = { tf, q: qcm.clone(), p: new THREE.Vector3(tcv[0], -tcv[1], -tcv[2]), qw: qwc.clone(), n };
+  // Какой режим лучше на ЭТОМ телефоне — проверяем прямо по распознаваниям, «вслепую»:
+  //  • обычный: где он предсказал центр листа на кадре до того, как увидел этот кадр;
+  //  • «по кадру»: где окажется центр листа, если этот кадр пропустить и взять середину между соседними.
+  // Сравниваем с центром листа по самому кадру. Не зависит ни от подбора задержки, ни от угла обзора.
+  const cmp = { g: 0, v: 0, n: 0 };
+  let cmpSince = null;
+  function compareModes(gErrPrev, a, b, c) {
+    // b — средний кадр, a и c — соседние
+    if (gErrPrev == null || c.tf - a.tf > 250 || b.n < 16) return;
+    const w = (b.tf - a.tf) / Math.max(1, c.tf - a.tf);
+    _qa.copy(a.q).slerp(c.q, w); _va.copy(a.p).lerp(c.p, w);
+    if (_va.z > -0.05) return;
+    const vErr = Math.hypot(st.cx + st.f * _va.x / -_va.z - b.cU, st.cy - st.f * _va.y / -_va.z - b.cV);
+    cmp.g = cmp.g * 0.97 + Math.min(gErrPrev, 40) * 0.03; cmp.v = cmp.v * 0.97 + Math.min(vErr, 40) * 0.03; cmp.n++;
+    st.cmpG = cmp.g; st.cmpV = cmp.v;
+    if (o.visMode !== 'auto' || cmp.n < o.cmpMinN || nowf() - st.initT < o.eisWarm) return;
+    const want = st.eis ? !(cmp.v > cmp.g * o.cmpOff) : cmp.v < cmp.g * o.cmpOn;
+    if (want === st.eis) cmpSince = null;
+    else if (cmpSince === null) cmpSince = nowf();
+    else if (nowf() - cmpSince > o.eisHold) { st.eis = want; cmpSince = null; st.eisSince = nowf(); }
+  }
+  function visAdd(tf, qcm, tcv, qwc, n, cU, cV, gErr) {
+    const rec = { tf, q: qcm.clone(), p: new THREE.Vector3(tcv[0], -tcv[1], -tcv[2]), qw: qwc.clone(), n, cU, cV, gErr };
+    if (vis.length >= 2) compareModes(vis[vis.length - 1].gErr, vis[vis.length - 2], vis[vis.length - 1], rec);
     // доля видимого поворота: по паре (этот кадр и кадр 0,1–0,5 с назад)
     if (st.gyro && n >= 16) {
       for (let i = vis.length - 1; i >= 0; i--) {
@@ -643,12 +675,14 @@ export function createFusion(opts = {}) {
         const g = rotVec(_qa.copy(b.qw).invert().multiply(qwc), new THREE.Vector3());     // поворот камеры по гироскопу
         const v = rotVec(_qb.copy(b.q).multiply(_qc.copy(qcm).invert()), new THREE.Vector3());   // по листу
         const gg = g.lengthSq();
-        if (gg > (0.5 * DEG) ** 2 && gg < (20 * DEG) ** 2) {
+        // первые секунды не считаем: задержка кадра ещё не подобрана, и сравнение поворотов врёт
+        // (на iPhone при холодном старте доля в первые 0,5 с выходила 0,56 — режим ложно включался)
+        if (nowf() - st.initT > o.eisWarm && gg > (1.0 * DEG) ** 2 && gg < (20 * DEG) ** 2) {
           eisS.gv = eisS.gv * 0.99 + g.dot(v); eisS.gg = eisS.gg * 0.99 + gg; eisS.n++;
           const k = eisS.gv / eisS.gg, enough = eisS.gg > (o.eisMinDeg * DEG) ** 2 && eisS.n > o.eisMinN;
           st.eisK = k;
-          if (enough && !st.eis && k < o.eisOn) st.eis = true;
-          else if (enough && st.eis && k > o.eisOff) st.eis = false;
+          // решение меняем, только если доля держится по ту сторона порога eisHold мс подряд
+          void enough;   // (доля — для панели; решение о режиме — compareModes)
         }
         break;
       }
@@ -717,10 +751,13 @@ export function createFusion(opts = {}) {
     offP.multiplyScalar(k);
     qOff.slerp(tq.identity(), 1 - k);
     tickTo(t);
-    let useVis = false;
-    if (o.visMode === 'on' || (o.visMode === 'auto' && st.eis)) {
+    // переход между обычным режимом и «по кадру» — плавный (за visRampMs), а не рывком
+    const visTarget = o.visMode === 'on' || (o.visMode === 'auto' && st.eis) ? 1 : 0;
+    st.visW += Math.sign(visTarget - st.visW) * Math.min(Math.abs(visTarget - st.visW), dt / o.visRampMs);
+    let useVis = false, vw = Math.min(st.visW, o.visBlend);
+    if (vw > 0) {
       useVis = visPose(tFrame, t, visQ, visP);
-      if (useVis && o.visBlend >= 1) { outQ.copy(visQ); outP.copy(visP); st.visShown = true; lastOutT = t; return true; }
+      if (useVis && vw >= 1) { outQ.copy(visQ); outP.copy(visP); st.visShown = true; lastOutT = t; return true; }
     }
     st.visShown = useVis;
     currentP(t, outP);
@@ -780,7 +817,7 @@ export function createFusion(opts = {}) {
     const qInv = tq2.copy(qCam).invert();
     outQ.copy(qInv).multiply(qOff).multiply(st.qMW);
     outP.applyQuaternion(qInv);
-    if (useVis) { outQ.slerp(visQ, o.visBlend); outP.lerp(visP, o.visBlend); }
+    if (useVis) { outQ.slerp(visQ, vw); outP.lerp(visP, vw); }
     // где на кадре центр сцены (над листом) — для учёта построчной съёмки на следующем кадре
     const e = tv2.set(0, 0, o.sceneH).applyQuaternion(outQ).add(outP);
     if (e.z < -0.05 && st.W) { showOx = Math.max(-0.7, Math.min(0.7, (st.f * e.x / -e.z) / st.W)); showOy = Math.max(-0.7, Math.min(0.7, (-st.f * e.y / -e.z) / st.H)); }
