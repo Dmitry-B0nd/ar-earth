@@ -423,6 +423,7 @@ export function createFusion(opts = {}) {
     forceReset = false;
     if (st.init && !reset) {
       const ang = 2 * Math.acos(Math.min(1, Math.abs(qT.dot(st.qMW)))) / DEG;
+      st.diag.innovDeg = ang;
       if (ang > 20) {
         // сильно не совпало: один раз — пропускаем; несколько раз подряд и согласованно — лист переложили
         const cons = outlierQ > 0 && 2 * Math.acos(Math.min(1, Math.abs(qT.dot(lastOutlierQ)))) / DEG < 8;
@@ -473,6 +474,14 @@ export function createFusion(opts = {}) {
     }
 
     const tms = tm / 1000, z = [pW.x, pW.y, pW.z];
+    // «снос»: насколько сцена (по прогнозу, без этого распознавания) разошлась с листом на этом кадре, в пикселях
+    st.diag.innovPx = null;
+    if (filters[st.filt].ok) {
+      filters[st.filt].stateAt(tms, xs);
+      const Zl = Math.max(0.2, Math.hypot(z[0], z[1], z[2]));
+      st.diag.innovPx = Math.hypot(z[0] - xs[0], z[1] - xs[1], z[2] - xs[2]) / Zl * st.f;
+    }
+    st.diag.rate = rate;
     // что сейчас на экране — чтобы поправка вошла плавно
     const before = lastOutT !== null ? currentP(lastOutT, tv2.set(0, 0, 0)).clone() : null;
     // скорость — по двум последним распознаваниям (если были недавно), чтобы после сброса не начинать «с места»

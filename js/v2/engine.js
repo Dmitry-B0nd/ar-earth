@@ -10,15 +10,15 @@
 //  • Задержка кадра и угол обзора камеры подбираются сами, по ходу (без перезагрузки).
 // Наружу — тот же набор, что у первого движка: renderer, scene, camera, content (ширина листа = 1, Z — вверх от листа).
 import * as THREE from 'three';
-import { createSensors } from './sensors.js?v=5.4';
-import { createFusion } from './fusion.js?v=5.4';
+import { createSensors } from './sensors.js?v=5.5';
+import { createFusion } from './fusion.js?v=5.5';
 
-const VER = '5.4';
+const VER = '5.5';
 const CAL_KEY = 'ar-earth-v2-cal-5.1';   // новая версия подбора обзора — старые (смещённые) значения не берём
 
 export function createEngine2(opts) {
   const { container, onFound, onLost, onStall, FOV = 66, CAMFPS = 60, MAXPIX = 76800, BOARDM = 0.18, BG = 'gl',
-    SKIPBLUR = 30, KEEP = 8000, TT0 = 0, BUDGET = 0, DELAY = -1, MAXDELAY = 140, LOCK = 0.7, DUTY = 1, LAG = null, SMOOTHCLK = false, GRAB = 'auto', AA = true, AUTOCAL = true, NATIVELAG = 60 } = opts;
+    SKIPBLUR = 30, KEEP = 8000, TT0 = 0, BUDGET = 0, DELAY = -1, MAXDELAY = 140, LOCK = 0.7, DUTY = 1, FILT = '', LAG = null, SMOOTHCLK = false, GRAB = 'auto', AA = true, AUTOCAL = true, NATIVELAG = 60 } = opts;
 
   // ---------- Рисование ----------
   const renderer = new THREE.WebGLRenderer({ antialias: AA, alpha: BG === 'native', powerPreference: 'default' });
@@ -63,7 +63,7 @@ export function createEngine2(opts) {
   const sensors = createSensors();
   let saved = {};
   try { saved = JSON.parse(localStorage.getItem(CAL_KEY) || '{}') || {}; } catch (e) {}
-  const fusion = createFusion({ sensors, boardM: BOARDM, lag: LAG ?? 50, autoLag: AUTOCAL, autoF: AUTOCAL, lock: DELAY === 0 ? 0 : LOCK });
+  const fusion = createFusion({ sensors, boardM: BOARDM, lag: LAG ?? 50, autoLag: AUTOCAL, autoF: AUTOCAL, lock: DELAY === 0 ? 0 : LOCK, force: FILT || undefined });
 
   // ---------- Состояние ----------
   let started = false, paused = false, frozen = false, frozenWant = false;
@@ -248,6 +248,7 @@ export function createEngine2(opts) {
     flushMotion();
     const r = fusion.measure({ tFrame: m.tFrame, pts: m.pts, n: m.n, H: m.H, err: m.n >= 8 ? m.err : null });
     if (r.ok) { stats.updates++; sec.found++; } else stats.rejected++;
+    record(now, m, r);
     if (AUTOCAL) fusion.calibStep(now);
     saveCal(now);
   }
@@ -382,6 +383,8 @@ export function createEngine2(opts) {
   const qOut = new THREE.Quaternion(), pOut = new THREE.Vector3(), one = new THREE.Vector3(1, 1, 1);
   function frame(now) {
     if (!started) return;
+    if (lastFrameNow) frameGapMax = Math.max(frameGapMax, now - lastFrameNow);
+    lastFrameNow = now;
     if (!hasRVFC) pollFrame(now);
     if (frozen) { needRender = true; content.visible = frozenWant; return; }
     flushMotion();
@@ -440,6 +443,48 @@ export function createEngine2(opts) {
     return x > vw * 0.1 && x < vw * 0.9 && y > vh * 0.1 && y < vh * 0.9;
   }
 
+  // ---------- Запись для разбора «сносов» (режим разработчика) ----------
+  // По каждому распознаванию: насколько сцена разошлась с листом (по прогнозу, до поправки) и что в этот момент
+  // происходило: скорость поворота, смаз, опоздание датчиков, выбранный фильтр, задержки, паузы основного потока.
+  // Кнопка «Сохранить запись» отдаёт последние ~30 с файлом — его можно прислать для разбора.
+  const REC = [], SLIDE_PX = 12;
+  let slides = 0, slideMax = 0, lastFrameNow = 0, frameGapMax = 0;
+  function record(now, m, r) {
+    const F = fusion.st, D = F.diag;
+    const e = {
+      t: Math.round(now), tf: Math.round(m.tFrame), ok: r.ok ? 1 : 0, why: r.why || (r.reset ? 'сброс' : ''),
+      snos: D.innovPx != null ? +D.innovPx.toFixed(1) : null, ang: D.innovDeg != null ? +D.innovDeg.toFixed(2) : null,
+      rate: Math.round((D.rate || 0) * 57.3), blur: +(D.blur || 0).toFixed(1), tags: m.tags, err: +(m.err || 0).toFixed(2),
+      ms: +m.ms.toFixed(1), lat: Math.round(now - (vf.last || now)), sensAge: Math.round(now - sensors.lastT),
+      filt: F.filt, lag: Math.round(fusion.lag), fov: +fusion.fov.toFixed(1), delay: Math.round(delayMs), lock: +(D.lockW || 0).toFixed(2),
+      gap: Math.round(frameGapMax), res: F.resets, rej: D.rej, sEv: Math.round(fusion.signEv || 0), g: fusion.gSign,
+    };
+    frameGapMax = 0;
+    REC.push(e); if (REC.length > 900) REC.shift();
+    if (e.snos != null && e.snos > SLIDE_PX) { slides++; slideMax = Math.max(slideMax, e.snos); }
+  }
+  async function saveRecord() {
+    const sd = sensors.diag;
+    const data = { build: VER, ua: navigator.userAgent, at: new Date().toISOString(), cam: [vw, vh], tsMode: vf.mode, tt: TARGET_TAG,
+      grab: grabMode, sensors: { ...sd }, rs: fusion.rs, rec: REC };
+    const name = 'ar-zapis-' + new Date().toISOString().slice(11, 19).replace(/:/g, '-') + '.json';
+    const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
+    try {
+      const file = new File([blob], name, { type: 'application/json' });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: name }); return; }
+    } catch (e) { if (e && e.name === 'AbortError') return; }
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
+    document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+  }
+  if (opts.DEV) {
+    const b = document.createElement('button');
+    b.textContent = 'Сохранить запись';
+    Object.assign(b.style, { position: 'fixed', left: '8px', bottom: 'calc(env(safe-area-inset-bottom, 0px) + 120px)', zIndex: '30',
+      padding: '8px 12px', borderRadius: '10px', border: '0', background: 'rgba(200,60,60,.85)', color: '#fff', font: '14px system-ui' });
+    b.addEventListener('click', (ev) => { ev.stopPropagation(); saveRecord(); });
+    document.body.appendChild(b);
+  }
+
   // ---------- Строки для режима разработчика ----------
   function devText() {
     const now = performance.now(), dt = Math.max(0.2, (now - secT) / 1000);
@@ -455,7 +500,8 @@ export function createEngine2(opts) {
     F.diag.corr = 0; F.diag.corrN = 0;
     const ext = sd.extra || 0; sd.extra = 0;
     const tags = sec.tags ? `меток ${sec.tags} (сторона ${sec.side.toFixed(0)} px)` : 'меток 0';
-    return `движок 2  камера ${vw}×${vh} ${fr ? Math.round(fr) + ' к/с' : ''}, новых ${per(d.frames)}/с (время ${vf.mode})\n` +
+    const slideTxt = `сносы (>${SLIDE_PX} px): ${slides}, макс ${slideMax.toFixed(0)} px` + (REC.length ? `, последний ${REC[REC.length - 1].snos ?? '—'} px` : '');
+    return `${slideTxt}\n` + `движок 2  камера ${vw}×${vh} ${fr ? Math.round(fr) + ' к/с' : ''}, новых ${per(d.frames)}/с (время ${vf.mode})\n` +
       `показ с задержкой ${delayMs.toFixed(0)} мс${DELAY < 0 ? ' (авто)' : ''}\n` +
       `поиск ${per(d.res)}/с: ${d.res ? (d.procMs / d.res).toFixed(1) : '—'} мс ${worker && workerOk ? 'в фоне' : 'в основном потоке'}` +
       ` + захват ${d.sent ? (d.grabMs / d.sent).toFixed(1) : '—'} мс (${grabMode === 'bitmap' ? 'картинкой' : 'пикселями'})\n` +

@@ -218,14 +218,14 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=5.4';
-import { createEngine2 } from './js/v2/engine.js?v=5.4';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=5.4';
-import { createImu } from './js/imu.js?v=5.4';
-import { createViewer3D } from './js/viewer3d.js?v=5.4';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=5.4';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=5.4';
-const BUILD = '5.4';
+import { createTracker } from './js/tracking.js?v=5.5';
+import { createEngine2 } from './js/v2/engine.js?v=5.5';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=5.5';
+import { createImu } from './js/imu.js?v=5.5';
+import { createViewer3D } from './js/viewer3d.js?v=5.5';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=5.5';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=5.5';
+const BUILD = '5.5';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -296,6 +296,8 @@ const E2 = {
   AUTOCAL: q.get('autocal') !== '0', AA: q.get('aa') !== '0',
   // показ кадра с задержкой на распознавание (delay=0 — без задержки, как в 5.0; число — мс; по умолчанию сама) и «привязка» к нему (lock 0…1)
   DELAY: q.has('delay') ? num('delay') : -1, LOCK: num('lock', 0.7), DUTY: num('duty', 1),
+  // filt=acc+|cv|hold — принудительно один способ учёта сдвигов (для опытов); DEV — кнопка записи
+  FILT: ['acc+', 'acc-', 'cv', 'hold'].includes(q.get('filt')) ? q.get('filt') : '', DEV: !!window.DEV,
 };
 if (ENGINE === 2) document.getElementById('hint').querySelector('img').src = 'img/marker-hint-v2.png';
 
