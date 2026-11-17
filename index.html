@@ -218,14 +218,14 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=5.6';
-import { createEngine2 } from './js/v2/engine.js?v=5.6';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=5.6';
-import { createImu } from './js/imu.js?v=5.6';
-import { createViewer3D } from './js/viewer3d.js?v=5.6';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=5.6';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=5.6';
-const BUILD = '5.6';
+import { createTracker } from './js/tracking.js?v=5.7';
+import { createEngine2 } from './js/v2/engine.js?v=5.7';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=5.7';
+import { createImu } from './js/imu.js?v=5.7';
+import { createViewer3D } from './js/viewer3d.js?v=5.7';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=5.7';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=5.7';
+const BUILD = '5.7';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -297,7 +297,7 @@ const E2 = {
   // показ кадра с задержкой на распознавание (delay=0 — без задержки, как в 5.0; число — мс; по умолчанию сама) и «привязка» к нему (lock 0…1)
   DELAY: q.has('delay') ? num('delay') : -1, LOCK: num('lock', 0.7), DUTY: num('duty', 1),
   // filt=acc+|cv|hold — принудительно один способ учёта сдвигов (для опытов); DEV — кнопка записи
-  FILT: ['acc+', 'acc-', 'cv', 'hold'].includes(q.get('filt')) ? q.get('filt') : '', DEV: !!window.DEV, ROIFIX: q.get('roifix') === '0' ? 0 : 1,
+  FILT: ['acc+', 'acc-', 'cv', 'hold', 'arm'].includes(q.get('filt')) ? q.get('filt') : '', DEV: !!window.DEV, ROIFIX: q.get('roifix') === '0' ? 0 : 1,
 };
 if (ENGINE === 2) document.getElementById('hint').querySelector('img').src = 'img/marker-hint-v2.png';
 

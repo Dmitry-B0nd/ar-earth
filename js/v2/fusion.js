@@ -140,7 +140,7 @@ export class Kf {
     if (this.hn < this.HN) this.hn++;
   }
   // шаг вперёд до времени t (с), a — ускорение телефона в осях комнаты (ед./с²) или null
-  predict(t, a, act) {
+  predict(t, a, act, disp) {
     if (act != null) this.act = act;
     if (!this.ok) return;
     let dt = t - this.t;
@@ -186,6 +186,8 @@ export class Kf {
       P[i * (N + 1)] += q11; P[i * N + i + 3] += q12; P[(i + 3) * N + i] += q12; P[(i + 3) * (N + 1)] += q22;
       if (N === 9) P[(i + 6) * (N + 1)] += qb;
     }
+    // известное смещение за шаг (модель «рука-шарнир»: камера описывает дугу вокруг запястья при повороте)
+    if (disp) { x[0] += disp[0]; x[1] += disp[1]; x[2] += disp[2]; }
     this.t += dt; if (this.t < t) this.t = t;
     this.push();
   }
@@ -327,9 +329,17 @@ export function createFusion(opts = {}) {
     'acc+': new Kf('acc', { sigA: ka, tauV: 3, sig0: o.accSig0 * u, kAct: o.accK }),
     'acc-': new Kf('acc', { sigA: ka, tauV: 3, sig0: o.accSig0 * u, kAct: o.accK }),
     cv: new Kf('cv', { sigA: kc, tauV: 0.6, sig0: o.cvSig0 * u, kAct: o.cvK }),
+    // «по повороту руки»: без акселерометра; сдвиг камеры — из поворота по гироскопу вокруг выученного «шарнира» (запястья)
+    arm: new Kf('arm', { sigA: 2 / o.boardM, tauV: 0.3 }),
     hold: new Kf('hold', { sigA: kc * 2, tauV: 0.02, sig0: o.cvSig0 * 2 * u, kAct: o.cvK * 2 }),    // без скорости: «стоит, где видели» (запасной, никогда не разгоняется)
   };
-  let gSign = 0, lastAccT = -1e9, actPeak = 0, actT = 0;     // знак ускорения у этого браузера: +1 как в стандарте, -1 обратный, 0 — неизвестно
+  let gSign = 0, lastAccT = -1e9, actPeak = 0, actT = 0;
+  // «шарнир» руки: положение камеры относительно точки вращения, в осях камеры (ширины листа).
+  // Начальное — камера ~5 см выше и ~10 см впереди запястья; дальше учится по распознаваниям.
+  const armR0 = new THREE.Vector3(0, 0.05 / o.boardM, -0.10 / o.boardM), armR = armR0.clone();
+  const armA = new Float64Array(9), armB = new Float64Array(3);
+  const qArm = new THREE.Quaternion(), qArmPrev = new THREE.Quaternion(), tvA = new THREE.Vector3(), tvB = new THREE.Vector3();
+  let armHave = false, armN = 0;     // знак ускорения у этого браузера: +1 как в стандарте, -1 обратный, 0 — неизвестно
   const offP = new THREE.Vector3(), qOff = new THREE.Quaternion();
   let lastOutT = null;
   const tq = new THREE.Quaternion(), tq2 = new THREE.Quaternion(), tv = new THREE.Vector3(), tv2 = new THREE.Vector3();
@@ -371,6 +381,14 @@ export function createFusion(opts = {}) {
       filters['acc+'].predict(ts, ap, act); filters['acc-'].predict(ts, am, act);
     } else { filters['acc+'].predict(ts, null); filters['acc-'].predict(ts, null); }
     filters.cv.predict(ts, null, act); filters.hold.predict(ts, null, act);
+    // шарнир: смещение камеры за шаг = −(R(t) − R(t_прошл))·r_c
+    if (S.camAt(t, qArm)) {
+      if (armHave) {
+        const v1 = tvA.copy(armR).applyQuaternion(qArm), v0 = tvB.copy(armR).applyQuaternion(qArmPrev);
+        filters.arm.predict(ts, null, act, [v0.x - v1.x, v0.y - v1.y, v0.z - v1.z]);
+      } else filters.arm.predict(ts, null, act);
+      qArmPrev.copy(qArm); armHave = true;
+    } else filters.arm.predict(ts, null, act);
   }
   // если датчик движения молчит — двигаем время фильтров сами
   function tickTo(t) { for (const k in filters) if (filters[k].t < t / 1000 - 0.03) filters[k].predict(t / 1000, null); }
@@ -381,7 +399,8 @@ export function createFusion(opts = {}) {
   const zAx = new THREE.Vector3(0, 0, 1);
   const resetTimes = [], ban = {}; let forceReset = false;
   const meas = []; let lastLockTf = -1;
-  let outlierQ = 0, outlierP = 0, lastOutlierQ = new THREE.Quaternion(), lastZ = null, lastZt = 0, lastZblur = 0;
+  let outlierQ = 0, outlierP = 0, lastOutlierQ = new THREE.Quaternion(), lastZ = null, lastZt = 0, lastZblur = 0, lastQWCok = false;
+  const lastQWC = new THREE.Quaternion();
   function measure(d) {
     // построчная съёмка: участок кадра, где лист, снят чуть раньше/позже «середины» кадра
     const hz = d.H[6] * 0.5 + d.H[7] * 0.5 + d.H[8];
@@ -480,6 +499,8 @@ export function createFusion(opts = {}) {
       filters[st.filt].stateAt(tms, xs);
       const Zl = Math.max(0.2, Math.hypot(z[0], z[1], z[2]));
       st.diag.innovPx = Math.hypot(z[0] - xs[0], z[1] - xs[1], z[2] - xs[2]) / Zl * st.f;
+      st.diag.innovAll = {};
+      for (const k in filters) if (filters[k].ok) { filters[k].stateAt(tms, xs); st.diag.innovAll[k] = +(Math.hypot(z[0] - xs[0], z[1] - xs[1], z[2] - xs[2]) / Zl * st.f).toFixed(1); }
     }
     st.diag.rate = rate;
     // что сейчас на экране — чтобы поправка вошла плавно
@@ -513,6 +534,27 @@ export function createFusion(opts = {}) {
       }
       chooseFilter();
     }
+    // учим «шарнир»: смещение по распознаваниям ≈ −(R1 − R0)·r_c (только при заметном повороте и чётких кадрах)
+    if (lastZ && st.gyro && lastQWCok && tms - lastZt < 0.25 && blurPx < 8 && lastZblur < 8 && !reset) {
+      const ang = 2 * Math.acos(Math.min(1, Math.abs(qWC.dot(lastQWC)))) / DEG;
+      if (ang > 0.6) {
+        const m1 = _m4.makeRotationFromQuaternion(qWC).elements.slice(), m0 = _m4.makeRotationFromQuaternion(lastQWC).elements;
+        const M = []; for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) M.push(m1[c * 4 + r] - m0[c * 4 + r]);
+        const dp = [z[0] - lastZ[0], z[1] - lastZ[1], z[2] - lastZ[2]];
+        const w = 1 / Math.max(1, st.diag.sigC || 1);
+        for (let i = 0; i < 9; i++) armA[i] *= 0.985;
+        for (let i = 0; i < 3; i++) armB[i] *= 0.985;
+        for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) { let v = 0; for (let k = 0; k < 3; k++) v += M[k * 3 + i] * M[k * 3 + j]; armA[i * 3 + j] += w * v; }
+        for (let i = 0; i < 3; i++) { let v = 0; for (let k = 0; k < 3; k++) v += M[k * 3 + i] * -dp[k]; armB[i] += w * v; }
+        armN++;
+        // решение с притяжением к начальному (чтобы при малом числе данных не «улететь»)
+        const lam = 0.02;
+        const A = [...armA]; A[0] += lam; A[4] += lam; A[8] += lam;
+        const sol = solve3(A, [armB[0] + lam * armR0.x, armB[1] + lam * armR0.y, armB[2] + lam * armR0.z]);
+        if (sol && Math.hypot(...sol) < 0.35 / o.boardM) armR.set(sol[0], sol[1], sol[2]);
+      }
+    }
+    lastQWC.copy(qWC); lastQWCok = st.gyro;
     lastZ = z; lastZt = tms; lastZblur = blurPx;
     // измерение «этого самого кадра» — для показа с задержкой: кадр, у которого есть своё распознавание,
     // ставим по нему (сцена жёстко привязана к картинке — без дрожи от неточного прогноза)
@@ -547,7 +589,7 @@ export function createFusion(opts = {}) {
     // предсказывает лучше — значит, у этого браузера ускорение и гравитация с разными знаками: переходим на него
     const wrong = signEv > 25 ? 'acc+' : 'acc-';
     // при равных — предпочитаем фильтр с акселерометром: мелкую дрожь руки между распознаваниями видит только он
-    const pref = { 'acc+': 0, 'acc-': 0, cv: 0.25, hold: 0.5 };
+    const pref = { 'acc+': 0, 'acc-': 0, arm: 0.15, cv: 0.25, hold: 0.5 };
     const score = (k) => filters[k].perr + pref[k] + (k === wrong && (gSign !== 0 || signEv > 25) ? (Math.abs(gVotes) >= 20 || signEv > 25 ? 5 : 0.5) : 0);
     if (o.force) { st.filt = o.force; return; }
     const banned = (k) => nowf() < (ban[k] || 0);
@@ -750,6 +792,7 @@ export function createFusion(opts = {}) {
     get f() { return st.f; }, get lag() { return st.lag; }, get gSign() { return gSign; },
     get signEv() { return signEv; },
     get rs() { return st.rs; },
+    get arm() { return { r: armR.clone().multiplyScalar(o.boardM * 100), n: armN }; },
     get fov() { return 2 * Math.atan(Math.max(st.W, st.H) / 2 / st.f) / DEG; },
     reset() { st.init = false; for (const k in filters) filters[k].ok = false; offP.set(0, 0, 0); qOff.identity(); },
     // лист долго не было видно: следующее распознавание принимаем как есть (телефон могли унести, лист — переложить),

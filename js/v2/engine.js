@@ -10,10 +10,10 @@
 //  • Задержка кадра и угол обзора камеры подбираются сами, по ходу (без перезагрузки).
 // Наружу — тот же набор, что у первого движка: renderer, scene, camera, content (ширина листа = 1, Z — вверх от листа).
 import * as THREE from 'three';
-import { createSensors } from './sensors.js?v=5.6';
-import { createFusion } from './fusion.js?v=5.6';
+import { createSensors } from './sensors.js?v=5.7';
+import { createFusion } from './fusion.js?v=5.7';
 
-const VER = '5.6';
+const VER = '5.7';
 const CAL_KEY = 'ar-earth-v2-cal-5.1';   // новая версия подбора обзора — старые (смещённые) значения не берём
 
 export function createEngine2(opts) {
@@ -467,7 +467,7 @@ export function createEngine2(opts) {
       rate: Math.round((D.rate || 0) * 57.3), blur: +(D.blur || 0).toFixed(1), tags: m.tags, err: +(m.err || 0).toFixed(2),
       ms: +m.ms.toFixed(1), lat: Math.round(now - (vf.last || now)), sensAge: Math.round(now - sensors.lastT),
       filt: F.filt, lag: Math.round(fusion.lag), fov: +fusion.fov.toFixed(1), delay: Math.round(delayMs), lock: +(D.lockW || 0).toFixed(2),
-      gap: Math.round(frameGapMax), res: F.resets, rej: D.rej, sEv: Math.round(fusion.signEv || 0), g: fusion.gSign,
+      all: D.innovAll || null, gap: Math.round(frameGapMax), res: F.resets, rej: D.rej, sEv: Math.round(fusion.signEv || 0), g: fusion.gSign,
     };
     frameGapMax = 0;
     REC.push(e); if (REC.length > 900) REC.shift();
@@ -481,7 +481,7 @@ export function createEngine2(opts) {
   async function saveRecord() {
     const sd = sensors.diag;
     const data = { build: VER, ua: navigator.userAgent, at: new Date().toISOString(), cam: [vw, vh], tsMode: vf.mode, tt: TARGET_TAG,
-      grab: grabMode, sensors: { ...sd }, rs: fusion.rs, rec: REC };
+      grab: grabMode, sensors: { ...sd }, rs: fusion.rs, arm: fusion.arm, rec: REC };
     const name = 'ar-zapis-' + new Date().toISOString().slice(11, 19).replace(/:/g, '-') + '.json';
     const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
     try {
@@ -507,7 +507,7 @@ export function createEngine2(opts) {
     secSnap = { ...sec }; secT = now;
     const trk = stream && stream.getVideoTracks()[0], fr = trk && trk.getSettings ? trk.getSettings().frameRate : null;
     const F = fusion.st, sd = sensors.diag, c = F.calib;
-    const fname = { 'acc+': 'с акселерометром', 'acc-': 'с акселерометром (обр. знак)', cv: 'по скорости', hold: 'на месте' }[F.filt] || F.filt;
+    const fname = { 'acc+': 'с акселерометром', 'acc-': 'с акселерометром (обр. знак)', cv: 'по скорости', arm: 'по повороту руки', hold: 'на месте' }[F.filt] || F.filt;
     const per = (v) => (v / dt).toFixed(0);
     // средний «скачок» поправки за секунду, пиксели видео (до плавного растворения) — мерило дрожи от распознавания
     const lockTxt = F.diag.lockW != null ? `  привязка ${Math.round(F.diag.lockW * 100)}% (шум углов ${F.diag.sigC.toFixed(1)} px)` : '';
@@ -523,7 +523,7 @@ export function createEngine2(opts) {
       `  ${sec.roi} (чёткость ${TARGET_TAG})  ${tags}  нашёл ${per(d.found)}/с  смаз: пропуск ${d.blurSkip} отказ ${F.diag.blurRej}  передышка ${d.dutySkip}${d.fails ? '  сбоев ' + d.fails : ''}\n` +
       `сдвиг: ${fname}  отсев ${F.diag.rej}  сбросов ${F.resets}  рассогл. ${F.diag.inconsist}  поправки ${corr}${lockTxt}\n` +
       `  промахи ${Object.entries(F.diag.nis).map(([k, v]) => k + ' ' + v.toFixed(1)).join('  ')}\n` +
-      `калибр.: задержка ${fusion.lag.toFixed(0)} мс  обзор ${fusion.fov.toFixed(1)}°  построчно ${fusion.rs.x.toFixed(0)}/${fusion.rs.y.toFixed(0)} мс  (подборов ${c.lagRuns}/${c.fRuns}/${c.rsRuns}${c.spread != null ? ', разброс ' + c.spread.toFixed(2) + '°' : ''})\n` +
+      `калибр.: задержка ${fusion.lag.toFixed(0)} мс  обзор ${fusion.fov.toFixed(1)}°  построчно ${fusion.rs.x.toFixed(0)}/${fusion.rs.y.toFixed(0)} мс  шарнир: выше ${fusion.arm.r.y.toFixed(0)}, впереди ${(-fusion.arm.r.z).toFixed(0)} см (${fusion.arm.n})  (подборов ${c.lagRuns}/${c.fRuns}/${c.rsRuns}${c.spread != null ? ', разброс ' + c.spread.toFixed(2) + '°' : ''})\n` +
       `датчики (${sensors.source}): ориент. ${sd.rel}/${sd.relNull} комп. ${sd.abs} движ. ${sd.mot} уск. ${sd.acc}  знак g ${fusion.gSign > 0 ? '+' : fusion.gSign < 0 ? '−' : '?'}${sd.late ? '  опозд. ' + sd.late : ''}  запаздывание до ${ext.toFixed(0)} мс\n` +
       `лист: ${markerState()}  смаз ${F.diag.blur.toFixed(0)} px  ошибка углов ${sec.err.toFixed(2)} px\n`;
   }
