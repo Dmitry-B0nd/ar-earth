@@ -10,15 +10,15 @@
 //  • Задержка кадра и угол обзора камеры подбираются сами, по ходу (без перезагрузки).
 // Наружу — тот же набор, что у первого движка: renderer, scene, camera, content (ширина листа = 1, Z — вверх от листа).
 import * as THREE from 'three';
-import { createSensors } from './sensors.js?v=5.3';
-import { createFusion } from './fusion.js?v=5.3';
+import { createSensors } from './sensors.js?v=5.4';
+import { createFusion } from './fusion.js?v=5.4';
 
-const VER = '5.3';
+const VER = '5.4';
 const CAL_KEY = 'ar-earth-v2-cal-5.1';   // новая версия подбора обзора — старые (смещённые) значения не берём
 
 export function createEngine2(opts) {
   const { container, onFound, onLost, onStall, FOV = 66, CAMFPS = 60, MAXPIX = 76800, BOARDM = 0.18, BG = 'gl',
-    SKIPBLUR = 30, KEEP = 8000, TT0 = 0, BUDGET = 0, DELAY = -1, MAXDELAY = 140, LOCK = 0.7, LAG = null, SMOOTHCLK = false, GRAB = 'auto', AA = true, AUTOCAL = true, NATIVELAG = 60 } = opts;
+    SKIPBLUR = 30, KEEP = 8000, TT0 = 0, BUDGET = 0, DELAY = -1, MAXDELAY = 140, LOCK = 0.7, DUTY = 1, LAG = null, SMOOTHCLK = false, GRAB = 'auto', AA = true, AUTOCAL = true, NATIVELAG = 60 } = opts;
 
   // ---------- Рисование ----------
   const renderer = new THREE.WebGLRenderer({ antialias: AA, alpha: BG === 'native', powerPreference: 'default' });
@@ -71,7 +71,7 @@ export function createEngine2(opts) {
   const vf = { t: 0, n: 0, fresh: false, mode: '—', last: 0 };   // последний кадр камеры
   let needRender = true, lastRenderT = 0, wasShown = false, texSize = '';
   const stats = { updates: 0, rejected: 0, fused: 0, imuAngSum: 0, imuN: 0, newFrames: 0, dups: 0, redetect: 0, coast: 0, pred: 0, jerks: 0 };
-  const sec = { frames: 0, sent: 0, res: 0, found: 0, blurSkip: 0, procMs: 0, grabMs: 0, readMs: 0, tags: 0, side: 0, roi: '', err: 0, fails: 0 };
+  const sec = { frames: 0, sent: 0, res: 0, found: 0, blurSkip: 0, dutySkip: 0, procMs: 0, grabMs: 0, readMs: 0, tags: 0, side: 0, roi: '', err: 0, fails: 0 };
   let secSnap = { ...sec }, secT = performance.now();
   const gaps = { pose: 0, proc: 0, lastPose: 0, lastProc: 0 };
   let visionLoops = 0;
@@ -86,7 +86,7 @@ export function createEngine2(opts) {
   let grabMode = GRAB === 'auto' ? (typeof OffscreenCanvas !== 'undefined' && typeof createImageBitmap === 'function' ? 'bitmap' : 'pixels') : GRAB;
   let bitmapFails = 0, bitmapProbed = false, lastTagsT = 0;
   const bitmapSince = performance.now();
-  let searchFlip = 0, lastGrabMs = 0;
+  let searchFlip = 0, lastGrabMs = 0, nextSendT = 0;
 
   function startVision() {
     try {
@@ -116,12 +116,12 @@ export function createEngine2(opts) {
   // вблизи участок сильно уменьшается, и шум углов в пикселях видео растёт — сцена дрожит.
   // Поэтому чёткость подстраивается под телефон: успевает быстро — смотрим подробнее (до 44), не успевает — грубее (до 18).
   let TARGET_TAG = TT0 || 26;
-  const qual = { t: performance.now(), ms: 0, n: 0 };
+  const qual = { t: performance.now(), ms: 0, n: 0 }; let qualAvg = 0;
   function adaptQuality(ms) {
     qual.ms += ms; qual.n++;
     const now = performance.now();
     if (now - qual.t < 1000 || qual.n < 3) return;
-    const avg = qual.ms / qual.n; qual.ms = 0; qual.n = 0; qual.t = now;
+    const avg = qual.ms / qual.n; qual.ms = 0; qual.n = 0; qual.t = now; qualAvg = avg;
     if (TT0) return;
     // Распознавание идёт в фоновом потоке (другое ядро) — ему можно отдать почти весь промежуток между кадрами.
     // Шум углов важнее частоты: при показе с задержкой кадры между распознаваниями сглаживаются, а шумные — дрожат.
@@ -147,7 +147,8 @@ export function createEngine2(opts) {
     } else {
       // ищем по всему кадру: попеременно обычный и более крупный масштаб (дальний лист мелкий)
       searchFlip ^= 1;
-      scale = Math.sqrt(MAXPIX / (vw * vh)) * (searchFlip ? 1.5 : 1);
+      const slow = qualAvg > 18;              // фоновый поток и так нагружен — крупный масштаб не берём
+      scale = Math.sqrt(MAXPIX / (vw * vh)) * (searchFlip && !slow ? 1.5 : 1);
     }
     scale = Math.min(scale, 1);
     let dw = Math.max(32, Math.round(sw * scale)), dh = Math.max(32, Math.round(sh * scale));
@@ -159,6 +160,10 @@ export function createEngine2(opts) {
   function sendFrame(tf) {
     if (busy || paused || frozen || !vw) return;
     if (!workerOk && !localDetect) return;
+    // Фоновый поток не должен занимать процессор целиком: у старых телефонов всего 2 быстрых ядра, и если
+    // распознавание молотит без передышки, основной поток (сцена, датчики) начинает подвисать — как раз на резких
+    // движениях, когда лист теряется и поиск идёт по всему кадру. Поэтому после каждого распознавания — пауза той же длины.
+    if (performance.now() < nextSendT) { sec.dutySkip++; return; }
     // сильный смаз (телефон резко поворачивают): кадр всё равно не распознается — не тратим силы,
     // сцену в это время держит гироскоп
     if (fusion.st.init && sensors.hasOrientation) {
@@ -224,6 +229,7 @@ export function createEngine2(opts) {
     const now = performance.now();
     visionLoops++; sec.res++;
     sec.procMs += m.ms; sec.readMs += m.readMs || 0;
+    nextSendT = now + Math.max(0, m.ms * DUTY - 4);
     adaptQuality(worker && workerOk ? m.ms : m.ms + lastGrabMs);
     if (gaps.lastProc) gaps.proc = Math.max(gaps.proc, now - gaps.lastProc);
     gaps.lastProc = now;
@@ -394,7 +400,13 @@ export function createEngine2(opts) {
       }
       // какой кадр показать: самый свежий из тех, что пришли не позже, чем delayMs назад
       let pick = null;
-      for (const r of ring) if (r.n >= 0 && (now - r.ta >= delayMs || ring.length === 1) && (!pick || r.n > pick.n)) pick = r;
+      // …и только тот, для момента съёмки которого уже есть показания гироскопа: на слабом телефоне при резких движениях
+      // основной поток подвисает, события датчиков приходят с опозданием — лучше показать кадр чуть старее,
+      // чем ставить сцену по угаданному повороту
+      const sT = sensors.lastT;
+      const covered = (r) => !sensors.hasOrientation || r.tf - fusion.lag - 20 <= sT;
+      for (const r of ring) if (r.n >= 0 && (now - r.ta >= delayMs || ring.length === 1) && covered(r) && (!pick || r.n > pick.n)) pick = r;
+      if (!pick) for (const r of ring) if (r.n >= 0 && (now - r.ta >= delayMs || ring.length === 1) && (!pick || r.n > pick.n)) pick = r;
       if (!pick) for (const r of ring) if (r.n >= 0 && (!pick || r.n < pick.n)) pick = r;      // все слишком свежие — самый старый
       if (pick && pick !== shownSlot) {
         shownSlot = pick; bg.material.map = pick.tex; bg.visible = true; needRender = true;
@@ -447,10 +459,10 @@ export function createEngine2(opts) {
       `показ с задержкой ${delayMs.toFixed(0)} мс${DELAY < 0 ? ' (авто)' : ''}\n` +
       `поиск ${per(d.res)}/с: ${d.res ? (d.procMs / d.res).toFixed(1) : '—'} мс ${worker && workerOk ? 'в фоне' : 'в основном потоке'}` +
       ` + захват ${d.sent ? (d.grabMs / d.sent).toFixed(1) : '—'} мс (${grabMode === 'bitmap' ? 'картинкой' : 'пикселями'})\n` +
-      `  ${sec.roi} (чёткость ${TARGET_TAG})  ${tags}  нашёл ${per(d.found)}/с  смаз: пропуск ${d.blurSkip} отказ ${F.diag.blurRej}${d.fails ? '  сбоев ' + d.fails : ''}\n` +
+      `  ${sec.roi} (чёткость ${TARGET_TAG})  ${tags}  нашёл ${per(d.found)}/с  смаз: пропуск ${d.blurSkip} отказ ${F.diag.blurRej}  передышка ${d.dutySkip}${d.fails ? '  сбоев ' + d.fails : ''}\n` +
       `сдвиг: ${fname}  отсев ${F.diag.rej}  сбросов ${F.resets}  рассогл. ${F.diag.inconsist}  поправки ${corr}${lockTxt}\n` +
       `  промахи ${Object.entries(F.diag.nis).map(([k, v]) => k + ' ' + v.toFixed(1)).join('  ')}\n` +
-      `калибр.: задержка ${fusion.lag.toFixed(0)} мс  обзор ${fusion.fov.toFixed(1)}°  (подборов ${c.lagRuns}/${c.fRuns}${c.spread != null ? ', разброс ' + c.spread.toFixed(2) + '°' : ''})\n` +
+      `калибр.: задержка ${fusion.lag.toFixed(0)} мс  обзор ${fusion.fov.toFixed(1)}°  построчно ${fusion.rs.x.toFixed(0)}/${fusion.rs.y.toFixed(0)} мс  (подборов ${c.lagRuns}/${c.fRuns}/${c.rsRuns}${c.spread != null ? ', разброс ' + c.spread.toFixed(2) + '°' : ''})\n` +
       `датчики (${sensors.source}): ориент. ${sd.rel}/${sd.relNull} комп. ${sd.abs} движ. ${sd.mot} уск. ${sd.acc}  знак g ${fusion.gSign > 0 ? '+' : fusion.gSign < 0 ? '−' : '?'}${sd.late ? '  опозд. ' + sd.late : ''}  запаздывание до ${ext.toFixed(0)} мс\n` +
       `лист: ${markerState()}  смаз ${F.diag.blur.toFixed(0)} px  ошибка углов ${sec.err.toFixed(2)} px\n`;
   }

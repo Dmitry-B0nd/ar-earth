@@ -300,6 +300,7 @@ export function createFusion(opts = {}) {
     autoLag: true, autoF: true,
     alphaQ: 0.35,        // скорость поправки поворота листа
     blendMs: 90,
+    sceneH: 0.55,        // высота центра сцены над листом (ширины листа)
     lock: 0,             // показ с задержкой: насколько ставить кадр по его собственному распознаванию (0…1)         // поправки на экране — плавно за это время
     sigPx: 0.6,          // погрешность угла метки на кадре, пиксели (на резком кадре)
     expo: 0.016,         // время выдержки камеры, с (для оценки смаза)
@@ -317,7 +318,8 @@ export function createFusion(opts = {}) {
     qOut: 0, qOutRef: new THREE.Quaternion(),
     filt: 'cv', posOut: 0, lastMeas: -1e9, lastMeasFrame: -1e9, resets: 0,
     gyro: false,
-    calib: { lagJ: null, fJ: null, samples: [], lastRun: 0, turn: 0, lagRuns: 0, fRuns: 0, spread: null },
+    rs: { x: 0, y: 0 },   // построчная съёмка: на сколько мс позже снят правый (x) / нижний (y) край кадра, чем середина ×2
+    calib: { rsDir: 0, rsRuns: 0, lagJ: null, fJ: null, samples: [], lastRun: 0, turn: 0, lagRuns: 0, fRuns: 0, spread: null },
     diag: { n: 0, rej: 0, blurRej: 0, corr: 0, corrN: 0, rmsK: 0, rmsH: 0, nis: {}, blur: 0, inconsist: 0 },
   };
   const ka = o.sigAacc / o.boardM, kc = o.sigAcv / o.boardM, u = 1 / o.boardM;
@@ -381,7 +383,10 @@ export function createFusion(opts = {}) {
   const meas = []; let lastLockTf = -1;
   let outlierQ = 0, outlierP = 0, lastOutlierQ = new THREE.Quaternion(), lastZ = null, lastZt = 0, lastZblur = 0;
   function measure(d) {
-    const tm = d.tFrame - st.lag;
+    // построчная съёмка: участок кадра, где лист, снят чуть раньше/позже «середины» кадра
+    const hz = d.H[6] * 0.5 + d.H[7] * 0.5 + d.H[8];
+    const ox = st.W ? ((d.H[0] * 0.5 + d.H[1] * 0.5 + d.H[2]) / hz) / st.W - 0.5 : 0, oy = st.H ? ((d.H[3] * 0.5 + d.H[4] * 0.5 + d.H[5]) / hz) / st.H - 0.5 : 0;
+    const tm = d.tFrame - st.lag + st.rs.x * ox + st.rs.y * oy;
     st.gyro = S.camAt(tm, qWC);
     if (!st.gyro) qWC.identity();
     const dec = decomposeH(d.H, st.f, st.cx, st.cy);
@@ -389,7 +394,7 @@ export function createFusion(opts = {}) {
     const rmsH = reprojRms(dec.R, dec.t, d.pts, d.n, st.f, st.cx, st.cy);
     quatFromRcv(dec.R, qCM);
     qMeas.copy(qWC).multiply(qCM);                       // лист в комнате (по этому кадру)
-    if (st.gyro && d.n >= 8) calibAdd(d, S.rateAt(tm));
+    if (st.gyro && d.n >= 8) calibAdd(d, S.rateAt(tm), ox, oy);
 
     // смаз: скорость поворота × выдержка × фокус
     const rate = st.gyro ? S.rateAt(tm) : 0;
@@ -555,9 +560,10 @@ export function createFusion(opts = {}) {
   // outQ: поворот «лист → камера three», outP: центр листа в осях камеры three. false — показывать нечего.
   let lastPoseNow = null;
   const qCam = new THREE.Quaternion();
+  let showOx = 0, showOy = 0;
   function poseAt(tFrame, outQ, outP, now = nowf()) {
     if (!st.init) return false;
-    const t = tFrame - st.lag;
+    const t = tFrame - st.lag + st.rs.x * showOx + st.rs.y * showOy;
     if (!S.camAt(t, qCam)) qCam.identity();
     // плавное «растворение» поправок
     const dt = lastPoseNow === null ? 0 : Math.max(0, now - lastPoseNow);
@@ -585,6 +591,9 @@ export function createFusion(opts = {}) {
     const qInv = tq2.copy(qCam).invert();
     outQ.copy(qInv).multiply(qOff).multiply(st.qMW);
     outP.applyQuaternion(qInv);
+    // где на кадре центр сцены (над листом) — для учёта построчной съёмки на следующем кадре
+    const e = tv2.set(0, 0, o.sceneH).applyQuaternion(outQ).add(outP);
+    if (e.z < -0.05 && st.W) { showOx = Math.max(-0.7, Math.min(0.7, (st.f * e.x / -e.z) / st.W)); showOy = Math.max(-0.7, Math.min(0.7, (-st.f * e.y / -e.z) / st.H)); }
     return true;
   }
   // «вверх» (против тяжести) в координатах листа
@@ -599,8 +608,8 @@ export function createFusion(opts = {}) {
   // при смене угла взгляда. Ищем задержку и фокус, при которых разброс меньше всего.
   // Сдвиги телефона на это не влияют (используется только поворот) — в отличие от прошлой калибровки.
   const C = st.calib;
-  function calibAdd(d, rate) {
-    C.samples.push({ t: d.tFrame, H: Array.from(d.H), rate });
+  function calibAdd(d, rate, ox, oy) {
+    C.samples.push({ t: d.tFrame, H: Array.from(d.H), rate, ox, oy });
     const cut = nowf() - 8000;
     while (C.samples.length && (C.samples[0].t < cut || C.samples.length > 60)) C.samples.shift();
   }
@@ -645,7 +654,7 @@ export function createFusion(opts = {}) {
     a.sort((x, y) => x - y);
     return a[Math.floor(a.length / 2)];
   }
-  const camsAt = (lag) => C.samples.map((s) => { const q = new THREE.Quaternion(); return S.camAt(s.t - lag, q) ? q : null; });
+  const camsAt = (lag, rx = st.rs.x, ry = st.rs.y) => C.samples.map((s) => { const q = new THREE.Quaternion(); return S.camAt(s.t - lag + rx * s.ox + ry * s.oy, q) ? q : null; });
   const cmsAt = (f) => C.samples.map((s) => { const d = decomposeH(s.H, f, st.cx, st.cy); return d ? quatFromRcv(d.R, new THREE.Quaternion()) : null; });
   // насколько «раскачан» телефон в окне: поворот (для задержки) и разнообразие углов взгляда (для фокуса)
   function excitation() {
@@ -664,7 +673,23 @@ export function createFusion(opts = {}) {
     if (now - C.lastRun < 700 || C.samples.length < 20) return;
     C.lastRun = now;
     const ex = excitation();
-    C.turn = (C.turn + 1) % 2;
+    C.turn = (C.turn + 1) % 3;
+    // Построчная съёмка (у старых камер кадр считывается 20–30 мс): при резком повороте лист в левой и правой части
+    // кадра «снят» в разные моменты. Подбираем время считывания так же, как задержку — по разбросу поворота листа.
+    if (C.turn === 2 && o.autoLag && ex.rot > 8) {
+      const cms = cmsAt(st.f);
+      const cur = spread(camsAt(st.lag), cms);
+      if (cur === null) return;
+      let bx = st.rs.x, by = st.rs.y, bj = cur;
+      for (let v = -40; v <= 40; v += 10) { const j = spread(camsAt(st.lag, v, by), cms); if (j !== null && j < bj) { bj = j; bx = v; } }
+      for (let v = -40; v <= 40; v += 10) { const j = spread(camsAt(st.lag, bx, v), cms); if (j !== null && j < bj) { bj = j; by = v; } }
+      const key = Math.sign(bx - st.rs.x) * 3 + Math.sign(by - st.rs.y);
+      if (bj < cur * 0.93 && key !== 0 && key === C.rsDir) {
+        st.rs.x += (bx - st.rs.x) * 0.5; st.rs.y += (by - st.rs.y) * 0.5; C.rsRuns++;
+      }
+      C.rsDir = bj < cur * 0.93 ? key : 0;
+      return;
+    }
     if (C.turn === 0 && o.autoLag && ex.rot > 8) {
       const cms = cmsAt(st.f);
       const cur = spread(camsAt(st.lag), cms);
@@ -715,6 +740,7 @@ export function createFusion(opts = {}) {
     st, filters, setCamera, motion, measure, poseAt, upInMarker, calibStep, tickTo,
     get f() { return st.f; }, get lag() { return st.lag; }, get gSign() { return gSign; },
     get signEv() { return signEv; },
+    get rs() { return st.rs; },
     get fov() { return 2 * Math.atan(Math.max(st.W, st.H) / 2 / st.f) / DEG; },
     reset() { st.init = false; for (const k in filters) filters[k].ok = false; offP.set(0, 0, 0); qOff.identity(); },
     // лист долго не было видно: следующее распознавание принимаем как есть (телефон могли унести, лист — переложить),
