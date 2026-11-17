@@ -223,15 +223,15 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=6.5';
-import { createEngine2 } from './js/v2/engine.js?v=6.5';
-import { createEngineXR, xrAvailable, requestXrSession } from './js/v2/xr.js?v=6.5';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=6.5';
-import { createImu } from './js/imu.js?v=6.5';
-import { createViewer3D } from './js/viewer3d.js?v=6.5';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=6.5';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=6.5';
-const BUILD = '6.5';
+import { createTracker } from './js/tracking.js?v=6.6';
+import { createEngine2 } from './js/v2/engine.js?v=6.6';
+import { createEngineXR, xrAvailable, requestXrSession } from './js/v2/xr.js?v=6.6';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=6.6';
+import { createImu } from './js/imu.js?v=6.6';
+import { createViewer3D } from './js/viewer3d.js?v=6.6';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=6.6';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=6.6';
+const BUILD = '6.6';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -385,7 +385,7 @@ async function start(mode) {
   const AR = mode !== '3d';
   // сеанс ARCore тоже можно открыть только сразу после нажатия (не получится — работаем как обычно)
   const xrReq = AR && ENGINE === 2 && navigator.xr && (XRMODE === 'on' || (XRMODE === 'auto' && xrOk))
-    ? requestXrSession(document.body).catch((e) => { console.warn('[ARCore] не запустился — обычный режим:', e && e.message || e); return null; })
+    ? requestXrSession(document.body).catch((e) => { console.warn('[ARCore] не запустился — обычный режим:', e && e.name, e && e.message || e, '|', (navigator.userAgent.match(/(Chrome|SamsungBrowser)\/[\d.]+/) || [''])[0]); return null; })
     : null;
   // доступ к датчикам спрашиваем самым первым — iOS разрешает это только сразу после нажатия
   const imuPermission = AR && P.USE_IMU ? imu.request() : Promise.resolve(false);

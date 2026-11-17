@@ -5,9 +5,9 @@
 // Кадр камеры: XRWebGLBinding.getCameraImage (функция WebXR «camera-access»). Уменьшаем и переводим в серый
 // на видеокарте, читаем без остановки рисования (через буфер и «забор»), распознаём в фоновом потоке.
 import * as THREE from 'three';
-import { decomposeH, quatFromRcv } from './fusion.js?v=6.5';
+import { decomposeH, quatFromRcv } from './fusion.js?v=6.6';
 
-const VER = '6.5';
+const VER = '6.6';
 const DEG = Math.PI / 180;
 
 // Поддерживает ли браузер такой режим (без запроса разрешений)
@@ -15,10 +15,11 @@ export async function xrAvailable() {
   try { return !!(navigator.xr && navigator.xr.isSessionSupported && await navigator.xr.isSessionSupported('immersive-ar')); } catch (e) { return false; }
 }
 // Запрос сессии — строго сразу по нажатию кнопки (иначе браузер откажет)
+// Доступ к кадру камеры (camera-access) есть не на всех телефонах — он необязателен: без него Землю ставят касанием
+// на поверхность, где лежит лист (поиск поверхности — hit-test ARCore), и дальше её точно так же держит ARCore.
 export function requestXrSession(root) {
   return navigator.xr.requestSession('immersive-ar', {
-    requiredFeatures: ['camera-access'],
-    optionalFeatures: ['dom-overlay', 'local'],
+    optionalFeatures: ['camera-access', 'hit-test', 'dom-overlay', 'local'],
     domOverlay: { root },
   });
 }
@@ -184,6 +185,33 @@ export function createEngineXR(opts) {
   const grab = createGrabber(gl, renderer);
   let flip = 0, flipVotes = 0, flipLocked = false;
 
+  // ---------- Режим «поставить касанием» (нет доступа к кадру камеры) ----------
+  // mode: 'marker' — ищем лист на кадре; 'place' — кольцо на поверхности в центре экрана, касание ставит Землю
+  let mode = 'marker', hitSource = null, hitOk = false, placed = false, camChecks = 0;
+  const hitP = new THREE.Vector3(), camFwd = new THREE.Vector3();
+  const reticle = new THREE.Mesh(new THREE.RingGeometry(0.035, 0.045, 40).rotateX(-Math.PI / 2),
+    new THREE.MeshBasicMaterial({ color: 0xff9628, transparent: true, opacity: 0.9, depthTest: false }));
+  reticle.visible = false; reticle.renderOrder = 999; scene.add(reticle);
+  async function enterPlaceMode(why) {
+    if (mode === 'place') return;
+    mode = 'place';
+    console.warn('[ARCore] кадр камеры недоступен (' + why + ') — режим «поставить касанием»');
+    const h = document.querySelector('#hint div'); if (h) h.textContent = 'Наведите на лист на столе и коснитесь экрана';
+    try {
+      const viewer = await session.requestReferenceSpace('viewer');
+      hitSource = await session.requestHitTestSource({ space: viewer });
+    } catch (e) { console.error('[ARCore] поиск поверхности недоступен:', e); }
+  }
+  function placeHere() {
+    if (mode !== 'place' || placed || !hitOk) return;
+    // лист — горизонтально в точке касания, «верх листа» — от зрителя (Земля повёрнута к нему)
+    const yaw = Math.atan2(-camFwd.x, -camFwd.z);
+    est.q.setFromAxisAngle(up, yaw).multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2));
+    est.p.copy(hitP); est.n = 2; est.snapped = true; est.lastT = performance.now();
+    placed = true; reticle.visible = false;
+    console.log('[ARCore] Земля поставлена касанием');
+  }
+
   // ---------- Распознавание в фоновом потоке ----------
   let worker = null, workerOk = false, workerBusy = false, reqId = 0;
   const pending = new Map();
@@ -289,7 +317,20 @@ export function createEngineXR(opts) {
     const ok = !!pose && !pose.emulatedPosition;
     tracking = !pose ? 'нет' : pose.emulatedPosition ? 'потерян (только поворот)' : 'есть';
     if (ok) lastTrackOk = now;
-    if (gl2 && binding && pose && ok && !paused && !frozen) {
+    // кадр камеры так и не появился — значит, доступа к нему нет
+    if (mode === 'marker' && pose && ok && !(pose.views[0] && pose.views[0].camera) && ++camChecks > 30) enterPlaceMode('нет кадра в виде');
+    if (mode === 'place' && pose) {
+      const m = pose.transform.matrix;
+      camFwd.set(-m[8], 0, -m[10]).normalize();
+      hitOk = false;
+      if (hitSource && !placed && ok) {
+        const hr = xf.getHitTestResults(hitSource);
+        const hp = hr.length ? hr[0].getPose(ref) : null;
+        if (hp) { hitOk = true; hitP.set(hp.transform.position.x, hp.transform.position.y, hp.transform.position.z); reticle.position.copy(hitP); }
+      }
+      reticle.visible = hitOk && !placed;
+    }
+    if (mode === 'marker' && gl2 && binding && pose && ok && !paused && !frozen) {
       grab.collect(() => !workerBusy, send);
       const view = pose.views[0];
       if (view && view.camera && workerOk && !workerBusy && !grab.pending) {
@@ -325,6 +366,7 @@ export function createEngineXR(opts) {
   }
 
   function markerState() {
+    if (mode === 'place') return placed ? 'поставлена касанием (сцену держит ARCore)' : hitOk ? 'поверхность найдена — коснитесь экрана' : 'ищу поверхность';
     if (!est.n) return 'не найден';
     const ago = (performance.now() - est.lastT) / 1000;
     return (est.snapped ? 'горизонтально' : 'наклон ' + est.tilt.toFixed(0) + '°') + (ago > 0.5 ? `, не видно ${ago.toFixed(1)} с (сцену держит ARCore)` : '');
@@ -336,7 +378,10 @@ export function createEngineXR(opts) {
     secSnap = { ...sec }; secT = now;
     const per = (v) => (v / dt).toFixed(0);
     const dev = est.dev.length ? est.dev.reduce((a, x) => [a[0] + x[0], a[1] + x[1]], [0, 0]).map((v) => v / est.dev.length) : null;
-    return `движок: ARCore (WebXR)  слежение: ${tracking}\n` +
+    const feats = session.enabledFeatures ? [...session.enabledFeatures].join(', ') : '?';
+    if (mode === 'place') return `движок: ARCore (WebXR), КАСАНИЕМ (нет кадра камеры)  слежение: ${tracking}\n` +
+      `функции: ${feats}\nЗемля: ${markerState()}\n`;
+    return `движок: ARCore (WebXR)  слежение: ${tracking}\n` + `функции: ${feats}\n` +
       `кадр камеры ${camSize} → поиск ${grab.w}×${grab.h}${flipLocked ? '' : ' (ориентация?)'}\n` +
       `поиск ${per(d.res)}/с: ${d.res ? (d.ms / d.res).toFixed(1) : '—'} мс в фоне + захват ${d.res ? (d.grabMs / d.res).toFixed(1) : '—'} мс  нашёл ${per(d.found)}/с  меток ${d.res ? (d.tags / d.res).toFixed(1) : 0}\n` +
       `лист в комнате: оценок ${est.n}, принято ${d.acc}, отсев ${sec.rej}, перестановок ${sec.jumps}\n` +
@@ -352,6 +397,12 @@ export function createEngineXR(opts) {
       await renderer.xr.setSession(session);
       if (!gl2) console.error('[ARCore] нет WebGL2 — кадр камеры не прочитать');
       try { binding = new XRWebGLBinding(session, gl); } catch (e) { console.error('[ARCore] нет доступа к кадру камеры:', e); }
+      const feats = session.enabledFeatures ? [...session.enabledFeatures] : null;
+      if (!gl2 || !binding) enterPlaceMode(!gl2 ? 'нет WebGL2' : 'нет XRWebGLBinding');
+      else if (feats && !feats.includes('camera-access')) enterPlaceMode('браузер не дал camera-access');
+      // касание экрана (в AR — событие select сеанса); касания кнопок поверх сцены сюда не доходят — их отсекаем
+      session.addEventListener('select', () => placeHere());
+      document.addEventListener('beforexrselect', (e) => { if (e.target.closest && e.target.closest('button, #card, #viewPanel, #chooser')) e.preventDefault(); });
       started = true;
       console.log('[ARCore] сеанс запущен; функции:', session.enabledFeatures ? [...session.enabledFeatures].join(', ') : '?',
         '| интерфейс поверх:', session.domOverlayState ? session.domOverlayState.type : 'нет');
@@ -375,6 +426,7 @@ export function createEngineXR(opts) {
     },
     // «заморозка»: сцена и так стоит на месте в комнате — просто перестаём её уточнять
     setFrozen(on) { frozen = on; },
+    get xrMode() { return mode; },
     setPaused(on) { paused = on; },
     setLite() {},
   };
