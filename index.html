@@ -223,15 +223,13 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=6.6';
-import { createEngine2 } from './js/v2/engine.js?v=6.6';
-import { createEngineXR, xrAvailable, requestXrSession } from './js/v2/xr.js?v=6.6';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=6.6';
-import { createImu } from './js/imu.js?v=6.6';
-import { createViewer3D } from './js/viewer3d.js?v=6.6';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=6.6';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=6.6';
-const BUILD = '6.6';
+// движки трекинга загружаются только тот, что выбран (import() ниже) — телефон не скачивает и не разбирает лишнее
+import { createEarth, loadEarthTextures } from './js/earth.js?v=7.0';
+import { createImu } from './js/imu.js?v=7.0';
+import { createViewer3D } from './js/viewer3d.js?v=7.0';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=7.0';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=7.0';
+const BUILD = '7.0';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -306,15 +304,24 @@ const E2 = {
   FILT: ['acc+', 'acc-', 'cv', 'hold', 'arm'].includes(q.get('filt')) ? q.get('filt') : '', DEV: !!window.DEV, ROIFIX: q.get('roifix') === '0' ? 0 : 1,
   // cam=720 — просить у камеры 1280×720 (у некоторых телефонов 60 к/с бывают только так: меньше смаз на рывках); euro — сглаживание, Гц
   // raw=1 — подробная запись (все показания датчиков) для прогона по записи; lockmode=interp, fewtags=1 — опыты 5.8–5.9
-  RESETCAL: q.get('resetcal') === '1', VISMODE: ['on', 'off', 'auto'].includes(q.get('vis')) ? q.get('vis') : 'auto', RAW: q.get('raw') === '1', LOCKMODE: q.get('lockmode') || 'frame', FEWTAGS: q.get('fewtags') === '1',
+  RESETCAL: q.get('resetcal') === '1', VISMODE: ['on', 'off', 'auto'].includes(q.get('vis')) ? q.get('vis') : 'off', RAW: q.get('raw') === '1', LOCKMODE: q.get('lockmode') || 'frame', FEWTAGS: q.get('fewtags') === '1',
   CAMW: q.get('cam') === '720' ? 1280 : 640, CAMH: q.get('cam') === '720' ? 720 : 480, EURO: num('euro', 0),
 };
 if (ENGINE === 2) document.getElementById('hint').querySelector('img').src = 'img/marker-hint-v2.png';
-// Режим ARCore (Android, Chrome; WebXR): положение телефона в комнате отслеживает ARCore, мы только находим лист
-// и закрепляем сцену на его месте. ?xr=0 — не использовать, ?xr=1 — пробовать всегда; по умолчанию — где браузер его поддерживает.
-const XRMODE = q.get('xr') === '0' ? 'off' : q.get('xr') === '1' ? 'on' : 'auto';
+// ---------- Режим трекинга: выбирается ОДИН раз при запуске и дальше не меняется ----------
+//  • arcore — Android с ARCore (Chrome, WebXR): положение телефона в комнате отслеживает ARCore, мы только находим лист;
+//  • gyro   — iPhone: движок 2 (гироскоп + лист меток), без автоматического переключения режимов;
+//  • camera — все остальные (бюджетные Android и т. п.): только по камере, без датчиков.
+// ?track=arcore|gyro|camera — выбрать вручную (для сравнения); ?engine=1 — самый старый движок (MindAR).
+const IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const TRACK = ['arcore', 'gyro', 'camera'].includes(q.get('track')) ? q.get('track') : q.get('xr') === '1' ? 'arcore' : 'auto';
 let xrOk = false;
-if (ENGINE === 2 && XRMODE !== 'off') xrAvailable().then((v) => { xrOk = v; console.log('[ARCore]', v ? 'доступен' : 'недоступен в этом браузере'); });
+if (ENGINE === 2 && navigator.xr && navigator.xr.isSessionSupported && (TRACK === 'arcore' || (TRACK === 'auto' && q.get('xr') !== '0'))) {
+  navigator.xr.isSessionSupported('immersive-ar').then((v) => { xrOk = v; console.log('[ARCore]', v ? 'доступен' : 'недоступен в этом браузере'); }, () => {});
+}
+// доступ к кадру камеры (camera-access) есть не везде — он необязателен (без него Землю ставят касанием)
+const requestXrSession = () => navigator.xr.requestSession('immersive-ar', {
+  optionalFeatures: ['camera-access', 'hit-test', 'dom-overlay', 'local'], domOverlay: { root: document.body } });
 
 const overlay = document.getElementById('overlay');
 const msg = document.getElementById('msg');
@@ -340,11 +347,12 @@ function reloadWithMode(mode) {
 }
 
 // ---------- Загрузка начинается сразу, не дожидаясь кнопки ----------
-let loaded = 0; const TOTAL = 7;
+let loaded = 0; const TOTAL = ENGINE === 1 ? 7 : 6;
 const tick = () => { loaded++; progress.textContent = loaded < TOTAL ? `Загружено ${loaded} из ${TOTAL}` : 'Всё загружено'; };
 
 const tMarker = performance.now();
-const markerPromise = fetch(MARKER_FILE, { cache: 'no-store' }).then(async (r) => {
+// файл картинки-метки (0,8 МБ) нужен только самому старому движку
+const markerPromise = ENGINE !== 1 ? Promise.resolve(null) : fetch(MARKER_FILE, { cache: 'no-store' }).then(async (r) => {
   if (r.status === 404) throw Object.assign(new Error('404'), { notFound: true });
   if (!r.ok) throw new Error('HTTP ' + r.status);
   const buf = await r.arrayBuffer();
@@ -384,8 +392,8 @@ async function start(mode) {
   started = true;
   const AR = mode !== '3d';
   // сеанс ARCore тоже можно открыть только сразу после нажатия (не получится — работаем как обычно)
-  const xrReq = AR && ENGINE === 2 && navigator.xr && (XRMODE === 'on' || (XRMODE === 'auto' && xrOk))
-    ? requestXrSession(document.body).catch((e) => { console.warn('[ARCore] не запустился — обычный режим:', e && e.name, e && e.message || e, '|', (navigator.userAgent.match(/(Chrome|SamsungBrowser)\/[\d.]+/) || [''])[0]); return null; })
+  const xrReq = AR && ENGINE === 2 && navigator.xr && (TRACK === 'arcore' || (TRACK === 'auto' && xrOk))
+    ? requestXrSession().catch((e) => { console.warn('[ARCore] не запустился — обычный режим:', e && e.name, e && e.message || e, '|', (navigator.userAgent.match(/(Chrome|SamsungBrowser)\/[\d.]+/) || [''])[0]); return null; })
     : null;
   // доступ к датчикам спрашиваем самым первым — iOS разрешает это только сразу после нажатия
   const imuPermission = AR && P.USE_IMU ? imu.request() : Promise.resolve(false);
@@ -424,16 +432,27 @@ async function start(mode) {
   if (AR) console.log('[датчики]', P.USE_IMU ? (imuOk ? 'доступ есть' : 'доступа нет — работаем только по камере') : 'выключены');
   const container = document.getElementById('container');
   const xrSession = xrReq ? await xrReq : null;
-  const tracker = !AR ? createViewer3D({ container }) : xrSession ? createEngineXR({
-    container, session: xrSession, BOARDM: E2.BOARDM, AA: E2.AA, XRW: num('xrw', 360), XRSCALE: num('xrscale', 1),
-    onFound: () => { status.textContent = 'Метка найдена'; status.classList.add('found'); },
-    onLost:  () => { status.textContent = 'Ищу метку…';   status.classList.remove('found'); },
-  }) : ENGINE === 2 ? createEngine2({
-    container, ...E2,
+  // режим — один раз и навсегда (до перезагрузки страницы)
+  const track = !AR ? '3d' : ENGINE === 1 ? 'mindar' : xrSession ? 'arcore' : TRACK === 'gyro' || TRACK === 'camera' ? TRACK : IOS ? 'gyro' : 'camera';
+  const cb = {
     onFound: () => { status.textContent = 'Метка найдена'; status.classList.add('found'); },
     onLost:  () => { status.textContent = 'Ищу метку…';   status.classList.remove('found'); },
     onStall: () => { document.getElementById('stall').style.display = 'flex'; },
-  }) : createTracker({
+  };
+  let mod;
+  try {
+    mod = track === 'arcore' ? await import('./js/v2/xr.js?v=7.0') : track === 'gyro' ? await import('./js/v2/engine.js?v=7.0')
+      : track === 'camera' ? await import('./js/v2/cam.js?v=7.0') : track === 'mindar' ? await import('./js/tracking.js?v=7.0') : null;
+  } catch (e) {
+    console.error('Ошибка загрузки движка:', e);
+    showError('Не удалось загрузить программу трекинга.<br>Обновите страницу.');
+    return;
+  }
+  const tracker = !AR ? createViewer3D({ container }) : track === 'arcore' ? mod.createEngineXR({
+    container, session: xrSession, BOARDM: E2.BOARDM, AA: E2.AA, XRW: num('xrw', 360), XRSCALE: num('xrscale', 1), ...cb,
+  }) : track === 'gyro' ? mod.createEngine2({ container, ...E2, ...cb })
+    : track === 'camera' ? mod.createEngineCam({ container, BOARDM: E2.BOARDM, AA: E2.AA, FOV: E2.FOV ?? 66, CAMFPS: num('camfps', 30), DEV: E2.DEV, ...cb })
+    : mod.createTracker({
     container, markerUrl, ...P, imu: imuOk ? imu : null,
     onFound: () => { status.textContent = 'Метка найдена'; status.classList.add('found'); },
     onLost:  () => { status.textContent = 'Ищу метку…';   status.classList.remove('found'); },
@@ -445,7 +464,7 @@ async function start(mode) {
     },
   });
   const { renderer, scene, camera, content } = tracker;
-  console.log('[трекинг]', AR ? (xrSession ? 'ARCore (WebXR) + лист меток' : ENGINE === 2 ? 'движок 2 (гироскоп + лист меток)' : 'движок 1 (MindAR)') : 'без камеры');
+  console.log('[трекинг]', { arcore: 'ARCore (WebXR) + лист меток', gyro: 'гироскоп + лист меток (движок 2)', camera: 'только по камере (без датчиков)', mindar: 'движок 1 (MindAR)', '3d': 'без камеры' }[track]);
   if (window.DEV) window.__tracker = tracker;      // для отладки из консоли
 
   // ---------- Сцена ----------

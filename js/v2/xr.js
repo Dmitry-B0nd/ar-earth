@@ -5,24 +5,13 @@
 // Кадр камеры: XRWebGLBinding.getCameraImage (функция WebXR «camera-access»). Уменьшаем и переводим в серый
 // на видеокарте, читаем без остановки рисования (через буфер и «забор»), распознаём в фоновом потоке.
 import * as THREE from 'three';
-import { decomposeH, quatFromRcv } from './fusion.js?v=6.6';
+import { decomposeH, quatFromRcv } from './fusion.js?v=7.0';
 
-const VER = '6.6';
+const VER = '7.0';
 const DEG = Math.PI / 180;
 
-// Поддерживает ли браузер такой режим (без запроса разрешений)
-export async function xrAvailable() {
-  try { return !!(navigator.xr && navigator.xr.isSessionSupported && await navigator.xr.isSessionSupported('immersive-ar')); } catch (e) { return false; }
-}
-// Запрос сессии — строго сразу по нажатию кнопки (иначе браузер откажет)
-// Доступ к кадру камеры (camera-access) есть не на всех телефонах — он необязателен: без него Землю ставят касанием
-// на поверхность, где лежит лист (поиск поверхности — hit-test ARCore), и дальше её точно так же держит ARCore.
-export function requestXrSession(root) {
-  return navigator.xr.requestSession('immersive-ar', {
-    optionalFeatures: ['camera-access', 'hit-test', 'dom-overlay', 'local'],
-    domOverlay: { root },
-  });
-}
+// (Проверка поддержки и запрос сеанса — в index.html: сеанс можно открыть только сразу по нажатию кнопки,
+//  а этот файл загружается позже. Доступ к кадру камеры необязателен: без него Землю ставят касанием.)
 
 // Место листа в пространстве ARCore по гомографии «лист (0…1, y вниз) → пиксели уменьшенного кадра w×h».
 // P — матрица проекции вида (по столбцам), qView/pView — поза камеры в момент съёмки этого кадра.
