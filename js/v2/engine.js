@@ -10,10 +10,10 @@
 //  • Задержка кадра и угол обзора камеры подбираются сами, по ходу (без перезагрузки).
 // Наружу — тот же набор, что у первого движка: renderer, scene, camera, content (ширина листа = 1, Z — вверх от листа).
 import * as THREE from 'three';
-import { createSensors } from './sensors.js?v=6.3';
-import { createFusion } from './fusion.js?v=6.3';
+import { createSensors } from './sensors.js?v=6.5';
+import { createFusion } from './fusion.js?v=6.5';
 
-const VER = '6.3';
+const VER = '6.5';
 const CAL_KEY = 'ar-earth-v2-cal-5.1';   // новая версия подбора обзора — старые (смещённые) значения не берём
 
 export function createEngine2(opts) {

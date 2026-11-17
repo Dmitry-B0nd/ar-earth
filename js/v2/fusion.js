@@ -303,7 +303,7 @@ export function createFusion(opts = {}) {
     alphaQ: 0.35,        // скорость поправки поворота листа
     blendMs: 90,
     sceneH: 0.55,
-    visMode: 'auto', eisOn: 0.9, eisOff: 0.95, eisMinDeg: 8, eisMinN: 20, eisWarm: 2500, eisHold: 2000, visRampMs: 400, cmpOn: 0.65, cmpOff: 0.85, cmpMinN: 25, visBlend: 1, visHF: 0,   // режим «по кадру» для камер со стабилизацией: auto / on / off
+    visMode: 'auto', eisOn: 0.9, eisOff: 0.95, eisMinDeg: 8, eisMinN: 20, eisWarm: 2500, eisHold: 2000, visRampMs: 400, cmpOn: 0.65, cmpOff: 0.85, cmpMinN: 25, visBlend: 1, visHF: 0, rotMin: 0.3, rotBeta: 0.2,   // режим «по кадру» для камер со стабилизацией: auto / on / off
     fovMin: 56, fovMax: 76,   // подбор угла обзора не выходит за эти пределы (у основных камер телефонов ~63–74°)
     euroMin: 0, euroBeta: 20,   // сглаживание положения (0 — выкл.; на тестах не помогло: дрожь руки видна и на видео, её надо повторять, а не сглаживать)        // высота центра сцены над листом (ширины листа)
     lock: 0,             // показ с задержкой: насколько ставить кадр по его собственному распознаванию (0…1)         // поправки на экране — плавно за это время
@@ -658,7 +658,10 @@ export function createFusion(opts = {}) {
     cmp.g = cmp.g * 0.97 + Math.min(gErrPrev, 40) * 0.03; cmp.v = cmp.v * 0.97 + Math.min(vErr, 40) * 0.03; cmp.n++;
     st.cmpG = cmp.g; st.cmpV = cmp.v;
     if (o.visMode !== 'auto' || cmp.n < o.cmpMinN || nowf() - st.initT < o.eisWarm) return;
-    const want = st.eis ? !(cmp.v > cmp.g * o.cmpOff) : cmp.v < cmp.g * o.cmpOn;
+    // 6.4: включаем «по кадру», только если и сравнение, и доля видимого поворота говорят о стабилизации
+    // (у iPhone доля ≈ 1,0 — вблизи сравнение могло ложно выбрать «по кадру», и сцена тряслась)
+    const eisLike = !(st.eisEnough && st.eisK > o.eisOff);
+    const want = st.eis ? !(cmp.v > cmp.g * o.cmpOff) && !(st.eisEnough && st.eisK > o.eisOff) : cmp.v < cmp.g * o.cmpOn && eisLike;
     if (want === st.eis) cmpSince = null;
     else if (cmpSince === null) cmpSince = nowf();
     else if (nowf() - cmpSince > o.eisHold) { st.eis = want; cmpSince = null; st.eisSince = nowf(); }
@@ -682,12 +685,29 @@ export function createFusion(opts = {}) {
           const k = eisS.gv / eisS.gg, enough = eisS.gg > (o.eisMinDeg * DEG) ** 2 && eisS.n > o.eisMinN;
           st.eisK = k;
           // решение меняем, только если доля держится по ту сторона порога eisHold мс подряд
-          void enough;   // (доля — для панели; решение о режиме — compareModes)
+          st.eisEnough = enough;
         }
         break;
       }
     }
     vis.push(rec); if (vis.length > 40) vis.shift();
+    rotEuro(tf, _qd.copy(qwc).multiply(qcm));
+  }
+  // Поворот листа «в комнате» (гироскоп × кадр), сглаженный фильтром 1€ (6.4).
+  // Поворот из одного кадра шумит (особенно вблизи, когда видно мало меток), а Земля висит над листом —
+  // шум наклона превращается в тряску Земли. Лист неподвижен, значит его поворот в комнате почти постоянен:
+  // его можно сильно сглаживать без запаздывания. На камерах со стабилизацией он медленно «плывёт» при
+  // поворотах телефона — фильтр это видит по скорости изменения и сглаживает меньше.
+  const rw = { t: null, q: new THREE.Quaternion(), w: 0 };
+  function rotEuro(tf, q) {
+    if (rw.t === null || tf - rw.t > 400 || tf <= rw.t) { rw.t = tf; rw.q.copy(q); rw.w = 0; return; }
+    const dt = (tf - rw.t) / 1000; rw.t = tf;
+    if (rw.q.dot(q) < 0) { q.x = -q.x; q.y = -q.y; q.z = -q.z; q.w = -q.w; }
+    const ang = 2 * Math.acos(Math.min(1, Math.abs(rw.q.dot(q)))) / DEG;          // град
+    rw.w += (ang / dt - rw.w) * alphaF(1.0, dt);                                     // скорость «плывущего» поворота, град/с
+    const fc = o.rotMin + o.rotBeta * rw.w;
+    rw.q.slerp(q, alphaF(fc, dt));
+    st.diag.rotW = rw.w;
   }
   // поза «по кадру»: false — нет подходящих распознаваний рядом
   function visPose(tFrame, t, outQ, outP) {
@@ -715,6 +735,7 @@ export function createFusion(opts = {}) {
         _qa.identity().slerp(res, o.visHF).invert();
         outQ.premultiply(_qa); outP.applyQuaternion(_qa);
       }
+      rotSmooth(t, outQ);
       return true;
     }
     if (!mb) { st.diag.visCase.none++; return false; }
@@ -725,7 +746,13 @@ export function createFusion(opts = {}) {
     const k = Math.max(0.5, Math.min(1, st.eisK));
     _qc.identity().slerp(dC, k).invert();
     outQ.copy(_qc).multiply(mb.q); outP.copy(mb.p).applyQuaternion(_qc);
+    rotSmooth(t, outQ);
     return true;
+  }
+  // поворот сцены — из сглаженного поворота листа в комнате и гироскопа (положение остаётся «по кадру»)
+  function rotSmooth(t, outQ) {
+    if (o.rotMin <= 0 || rw.t === null || !S.camAt(t, _qe)) return;
+    outQ.copy(_qe.invert().multiply(rw.q));
   }
   const eu = { t: null, x: new THREE.Vector3(), dx: new THREE.Vector3() };
   const alphaF = (fc, dt) => { const r = 2 * Math.PI * fc * dt; return r / (r + 1); };
