@@ -302,7 +302,8 @@ export function createFusion(opts = {}) {
     autoLag: true, autoF: true,
     alphaQ: 0.35,        // скорость поправки поворота листа
     blendMs: 90,
-    sceneH: 0.55,        // высота центра сцены над листом (ширины листа)
+    sceneH: 0.55,
+    euroMin: 0, euroBeta: 20,   // сглаживание положения (0 — выкл.; на тестах не помогло: дрожь руки видна и на видео, её надо повторять, а не сглаживать)        // высота центра сцены над листом (ширины листа)
     lock: 0,             // показ с задержкой: насколько ставить кадр по его собственному распознаванию (0…1)         // поправки на экране — плавно за это время
     sigPx: 0.6,          // погрешность угла метки на кадре, пиксели (на резком кадре)
     expo: 0.016,         // время выдержки камеры, с (для оценки смаза)
@@ -399,6 +400,7 @@ export function createFusion(opts = {}) {
   const zAx = new THREE.Vector3(0, 0, 1);
   const resetTimes = [], ban = {}; let forceReset = false;
   const meas = []; let lastLockTf = -1;
+  const lockA = new THREE.Vector3(), lockB = new THREE.Vector3();
   let outlierQ = 0, outlierP = 0, lastOutlierQ = new THREE.Quaternion(), lastZ = null, lastZt = 0, lastZblur = 0, lastQWCok = false;
   const lastQWC = new THREE.Quaternion();
   function measure(d) {
@@ -480,7 +482,9 @@ export function createFusion(opts = {}) {
     mx /= d.n; my /= d.n;
     for (let i = 0; i < d.n; i++) { sx += (d.pts[i * 4 + 2] - mx) ** 2; sy += (d.pts[i * 4 + 3] - my) ** 2; }
     const span = Math.max(8, Math.sqrt((sx + sy) / d.n) * 2);
-    const Z = tCam[2], s2 = sig + rms * 0.5;
+    // одна-две метки (лист у края кадра, только что снова найден после рывка) — измерение менее надёжно
+    const fewK = d.n <= 4 ? 2 : d.n <= 8 ? 1.4 : 1;
+    const Z = tCam[2], s2 = (sig + rms * 0.5) * fewK;
     const sl = s2 * Z / st.f, sd = Z * s2 * 2.5 / span;
     // R_w = Rwc · diag(sl², sl², sd²) · Rwcᵀ  (ось взгляда камеры three — Z)
     const e = _m4.makeRotationFromQuaternion(qWC).elements;
@@ -562,9 +566,9 @@ export function createFusion(opts = {}) {
     // шумное (слабый телефон, грубый участок) — не привязываем: иначе шум углов прямо передаётся Земле
     const sigC = d.err != null ? Math.max(0.3, 1.3 * d.err) : sig;   // шум углов по подгонке гомографии этого кадра (смаз в ней уже виден)
     st.diag.sigC = sigC;
-    const lockW = o.lock * Math.max(0, Math.min(1, (1.8 - sigC) / 1.2));
+    const lockW = o.lock * Math.max(0, Math.min(1, (1.8 - sigC) / 1.2)) * Math.min(1, d.n / 16);
     st.diag.lockW = lockW;
-    meas.push({ tf: d.tFrame, z: z.slice(), sl, w: lockW }); if (meas.length > 16) meas.shift();
+    meas.push({ tf: d.tFrame, tm, z: z.slice(), sl, w: lockW }); if (meas.length > 16) meas.shift();
     for (const k in filters) st.diag.nis[k] = filters[k].perr;
     // плавность: разница между старым и новым видом уходит за blendMs
     if (before && st.init && !reset) {
@@ -612,6 +616,19 @@ export function createFusion(opts = {}) {
   let lastPoseNow = null;
   const qCam = new THREE.Quaternion();
   let showOx = 0, showOy = 0;
+  const eu = { t: null, x: new THREE.Vector3(), dx: new THREE.Vector3() };
+  const alphaF = (fc, dt) => { const r = 2 * Math.PI * fc * dt; return r / (r + 1); };
+  function euro(p, tMs) {
+    if (eu.t === null || tMs - eu.t > 300 || tMs <= eu.t) { eu.t = tMs; eu.x.copy(p); eu.dx.set(0, 0, 0); return; }
+    const dt = (tMs - eu.t) / 1000; eu.t = tMs;
+    const ad = alphaF(1.0, dt);
+    eu.dx.lerp(tv.copy(p).sub(eu.x).multiplyScalar(1 / dt), ad);
+    // скорость в ширинах листа/с → частота среза; ещё и «на всякий случай» по скорости поворота телефона
+    const rate = S.rateAt ? S.rateAt(tMs - st.lag) : 0;
+    const fc = o.euroMin + o.euroBeta * eu.dx.length() + 8 * rate;
+    eu.x.lerp(p, alphaF(fc, dt));
+    p.copy(eu.x);
+  }
   function poseAt(tFrame, outQ, outP, now = nowf()) {
     if (!st.init) return false;
     const t = tFrame - st.lag + st.rs.x * showOx + st.rs.y * showOy;
@@ -624,20 +641,36 @@ export function createFusion(opts = {}) {
     qOff.slerp(tq.identity(), 1 - k);
     tickTo(t);
     currentP(t, outP);
-    if (o.lock > 0) {
-      // есть распознавание ровно этого кадра — притягиваем к нему (доля lock), иначе — сглаженное между соседними
+    if (o.lock > 0 && meas.length) {
+      // Привязка к распознаваниям: поправка «к листу» c = w·(измерение − оценка) считается в моменты распознаваний
+      // и для кадров МЕЖДУ ними плавно переходит от предыдущей к следующей. Раньше притягивался только сам
+      // распознанный кадр — при 15 распознаваниях на 30 кадров это давало дрожь «через кадр».
+      let mb = null, ma = null;
       for (let i = meas.length - 1; i >= 0; i--) {
         const m = meas[i];
-        if (Math.abs(m.tf - tFrame) < 2) {
-          if (m.tf !== lastLockTf) {           // насколько прогноз расходился с распознаванием этого кадра — мерило дрожи
-            lastLockTf = m.tf;
-            st.diag.corr += Math.hypot(m.z[0] - outP.x, m.z[1] - outP.y, m.z[2] - outP.z) / Math.max(0.3, outP.length()) * st.f; st.diag.corrN++;
-          }
-          outP.x += m.w * (m.z[0] - outP.x); outP.y += m.w * (m.z[1] - outP.y); outP.z += m.w * (m.z[2] - outP.z); break; }
-        if (m.tf < tFrame - 10) break;
+        if (m.tf > tFrame + 1) { if (m.tf - tFrame < 250) ma = m; continue; }
+        if (tFrame - m.tf < 250) mb = m;
+        break;
+      }
+      const corr = (m, out) => { currentP(m.tm, tv); return out.set(m.w * (m.z[0] - tv.x), m.w * (m.z[1] - tv.y), m.w * (m.z[2] - tv.z)); };
+      if (mb && Math.abs(mb.tf - tFrame) < 2 && mb.tf !== lastLockTf) {     // мерило дрожи: прогноз против распознавания
+        lastLockTf = mb.tf;
+        st.diag.corr += Math.hypot(mb.z[0] - outP.x, mb.z[1] - outP.y, mb.z[2] - outP.z) / Math.max(0.3, outP.length()) * st.f; st.diag.corrN++;
+      }
+      if (mb && ma) {
+        const w = (tFrame - mb.tf) / Math.max(1, ma.tf - mb.tf);
+        corr(mb, lockB); corr(ma, lockA);
+        outP.x += lockB.x + w * (lockA.x - lockB.x); outP.y += lockB.y + w * (lockA.y - lockB.y); outP.z += lockB.z + w * (lockA.z - lockB.z);
+      } else if (mb || ma) {
+        const m = mb || ma, k = Math.exp(-Math.abs(tFrame - m.tf) / 80);   // только с одной стороны — поправка угасает
+        corr(m, lockB); outP.addScaledVector(lockB, k);
       }
     }
     outP.add(offP);
+    // Мягкое сглаживание положения («фильтр 1€»): пока телефон почти неподвижен, шум распознавания (доли пикселя,
+    // но вблизи Земли — заметная дрожь) усредняется; как только телефон двигается — сглаживание почти исчезает
+    // и задержки не добавляет. Поворот не трогаем — его точно даёт гироскоп.
+    if (o.euroMin > 0) euro(outP, tFrame);
     lastOutT = t;
     const qInv = tq2.copy(qCam).invert();
     outQ.copy(qInv).multiply(qOff).multiply(st.qMW);

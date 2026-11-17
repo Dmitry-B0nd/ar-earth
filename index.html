@@ -218,14 +218,14 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=5.7';
-import { createEngine2 } from './js/v2/engine.js?v=5.7';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=5.7';
-import { createImu } from './js/imu.js?v=5.7';
-import { createViewer3D } from './js/viewer3d.js?v=5.7';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=5.7';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=5.7';
-const BUILD = '5.7';
+import { createTracker } from './js/tracking.js?v=5.8';
+import { createEngine2 } from './js/v2/engine.js?v=5.8';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=5.8';
+import { createImu } from './js/imu.js?v=5.8';
+import { createViewer3D } from './js/viewer3d.js?v=5.8';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=5.8';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=5.8';
+const BUILD = '5.8';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -298,6 +298,8 @@ const E2 = {
   DELAY: q.has('delay') ? num('delay') : -1, LOCK: num('lock', 0.7), DUTY: num('duty', 1),
   // filt=acc+|cv|hold — принудительно один способ учёта сдвигов (для опытов); DEV — кнопка записи
   FILT: ['acc+', 'acc-', 'cv', 'hold', 'arm'].includes(q.get('filt')) ? q.get('filt') : '', DEV: !!window.DEV, ROIFIX: q.get('roifix') === '0' ? 0 : 1,
+  // cam=720 — просить у камеры 1280×720 (у некоторых телефонов 60 к/с бывают только так: меньше смаз на рывках); euro — сглаживание, Гц
+  CAMW: q.get('cam') === '720' ? 1280 : 640, CAMH: q.get('cam') === '720' ? 720 : 480, EURO: num('euro', 0),
 };
 if (ENGINE === 2) document.getElementById('hint').querySelector('img').src = 'img/marker-hint-v2.png';
 

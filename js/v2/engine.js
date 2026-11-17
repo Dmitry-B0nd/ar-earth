@@ -10,15 +10,15 @@
 //  • Задержка кадра и угол обзора камеры подбираются сами, по ходу (без перезагрузки).
 // Наружу — тот же набор, что у первого движка: renderer, scene, camera, content (ширина листа = 1, Z — вверх от листа).
 import * as THREE from 'three';
-import { createSensors } from './sensors.js?v=5.7';
-import { createFusion } from './fusion.js?v=5.7';
+import { createSensors } from './sensors.js?v=5.8';
+import { createFusion } from './fusion.js?v=5.8';
 
-const VER = '5.7';
+const VER = '5.8';
 const CAL_KEY = 'ar-earth-v2-cal-5.1';   // новая версия подбора обзора — старые (смещённые) значения не берём
 
 export function createEngine2(opts) {
   const { container, onFound, onLost, onStall, FOV = 66, CAMFPS = 60, MAXPIX = 76800, BOARDM = 0.18, BG = 'gl',
-    SKIPBLUR = 30, KEEP = 8000, TT0 = 0, BUDGET = 0, DELAY = -1, MAXDELAY = 140, LOCK = 0.7, DUTY = 1, FILT = '', ROIFIX = 1, LAG = null, SMOOTHCLK = false, GRAB = 'auto', AA = true, AUTOCAL = true, NATIVELAG = 60 } = opts;
+    SKIPBLUR = 30, KEEP = 8000, TT0 = 0, BUDGET = 0, DELAY = -1, MAXDELAY = 140, LOCK = 0.7, DUTY = 1, FILT = '', ROIFIX = 1, CAMW = 640, CAMH = 480, EURO = 0, LAG = null, SMOOTHCLK = false, GRAB = 'auto', AA = true, AUTOCAL = true, NATIVELAG = 60 } = opts;
 
   // ---------- Рисование ----------
   const renderer = new THREE.WebGLRenderer({ antialias: AA, alpha: BG === 'native', powerPreference: 'default' });
@@ -63,7 +63,7 @@ export function createEngine2(opts) {
   const sensors = createSensors();
   let saved = {};
   try { saved = JSON.parse(localStorage.getItem(CAL_KEY) || '{}') || {}; } catch (e) {}
-  const fusion = createFusion({ sensors, boardM: BOARDM, lag: LAG ?? 50, autoLag: AUTOCAL, autoF: AUTOCAL, lock: DELAY === 0 ? 0 : LOCK, force: FILT || undefined });
+  const fusion = createFusion({ sensors, boardM: BOARDM, lag: LAG ?? 50, autoLag: AUTOCAL, autoF: AUTOCAL, lock: DELAY === 0 ? 0 : LOCK, force: FILT || undefined, euroMin: EURO });
 
   // ---------- Состояние ----------
   let started = false, paused = false, frozen = false, frozenWant = false;
@@ -362,7 +362,7 @@ export function createEngine2(opts) {
   // ---------- Камера ----------
   let stream = null;
   async function openCamera(fps) {
-    const c = { audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: fps } } };
+    const c = { audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: CAMW }, height: { ideal: CAMH }, frameRate: { ideal: fps } } };
     stream = await navigator.mediaDevices.getUserMedia(c);
     video.srcObject = stream;
     await video.play().catch(() => {});
@@ -480,7 +480,8 @@ export function createEngine2(opts) {
   }
   async function saveRecord() {
     const sd = sensors.diag;
-    const data = { build: VER, ua: navigator.userAgent, at: new Date().toISOString(), cam: [vw, vh], tsMode: vf.mode, tt: TARGET_TAG,
+    const trk = stream && stream.getVideoTracks()[0], cs = trk && trk.getSettings ? trk.getSettings() : {};
+    const data = { build: VER, ua: navigator.userAgent, camSettings: { w: cs.width, h: cs.height, fps: cs.frameRate }, at: new Date().toISOString(), cam: [vw, vh], tsMode: vf.mode, tt: TARGET_TAG,
       grab: grabMode, sensors: { ...sd }, rs: fusion.rs, arm: fusion.arm, rec: REC };
     const name = 'ar-zapis-' + new Date().toISOString().slice(11, 19).replace(/:/g, '-') + '.json';
     const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
@@ -575,7 +576,7 @@ export function createEngine2(opts) {
     setLite(on) {
       const trk = stream && stream.getVideoTracks()[0];
       const fps = on ? 30 : CAMFPS;
-      if (trk && trk.applyConstraints) trk.applyConstraints({ width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: fps } }).catch(() => {});
+      if (trk && trk.applyConstraints) trk.applyConstraints({ width: { ideal: CAMW }, height: { ideal: CAMH }, frameRate: { ideal: fps } }).catch(() => {});
     },
   };
 }
