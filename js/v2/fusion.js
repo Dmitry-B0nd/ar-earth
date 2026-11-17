@@ -483,7 +483,7 @@ export function createFusion(opts = {}) {
     for (let i = 0; i < d.n; i++) { sx += (d.pts[i * 4 + 2] - mx) ** 2; sy += (d.pts[i * 4 + 3] - my) ** 2; }
     const span = Math.max(8, Math.sqrt((sx + sy) / d.n) * 2);
     // одна-две метки (лист у края кадра, только что снова найден после рывка) — измерение менее надёжно
-    const fewK = d.n <= 4 ? 2 : d.n <= 8 ? 1.4 : 1;
+    const fewK = o.fewTags && d.n <= 4 ? 2 : o.fewTags && d.n <= 8 ? 1.4 : 1;   // опыт 5.8 — выключен
     const Z = tCam[2], s2 = (sig + rms * 0.5) * fewK;
     const sl = s2 * Z / st.f, sd = Z * s2 * 2.5 / span;
     // R_w = Rwc · diag(sl², sl², sd²) · Rwcᵀ  (ось взгляда камеры three — Z)
@@ -566,7 +566,7 @@ export function createFusion(opts = {}) {
     // шумное (слабый телефон, грубый участок) — не привязываем: иначе шум углов прямо передаётся Земле
     const sigC = d.err != null ? Math.max(0.3, 1.3 * d.err) : sig;   // шум углов по подгонке гомографии этого кадра (смаз в ней уже виден)
     st.diag.sigC = sigC;
-    const lockW = o.lock * Math.max(0, Math.min(1, (1.8 - sigC) / 1.2)) * Math.min(1, d.n / 16);
+    const lockW = o.lock * Math.max(0, Math.min(1, (1.8 - sigC) / 1.2)) * (o.fewTags ? Math.min(1, d.n / 16) : 1);
     st.diag.lockW = lockW;
     meas.push({ tf: d.tFrame, tm, z: z.slice(), sl, w: lockW }); if (meas.length > 16) meas.shift();
     for (const k in filters) st.diag.nis[k] = filters[k].perr;
@@ -641,7 +641,21 @@ export function createFusion(opts = {}) {
     qOff.slerp(tq.identity(), 1 - k);
     tickTo(t);
     currentP(t, outP);
-    if (o.lock > 0 && meas.length) {
+    if (o.lock > 0 && o.lockMode !== 'interp') {
+      // (как в 5.7) есть распознавание ровно этого кадра — притягиваем к нему (доля lock)
+      for (let i = meas.length - 1; i >= 0; i--) {
+        const m = meas[i];
+        if (Math.abs(m.tf - tFrame) < 2) {
+          if (m.tf !== lastLockTf) {
+            lastLockTf = m.tf;
+            st.diag.corr += Math.hypot(m.z[0] - outP.x, m.z[1] - outP.y, m.z[2] - outP.z) / Math.max(0.3, outP.length()) * st.f; st.diag.corrN++;
+          }
+          outP.x += m.w * (m.z[0] - outP.x); outP.y += m.w * (m.z[1] - outP.y); outP.z += m.w * (m.z[2] - outP.z); break;
+        }
+        if (m.tf < tFrame - 10) break;
+      }
+    }
+    if (o.lock > 0 && o.lockMode === 'interp' && meas.length) {   // опыт 5.8–5.9 (хуже на слабом телефоне), ?lockmode=interp
       // Привязка к распознаваниям: поправка «к листу» c = w·(измерение − оценка) считается в моменты распознаваний
       // и для кадров МЕЖДУ ними плавно переходит от предыдущей к следующей. Раньше притягивался только сам
       // распознанный кадр — при 15 распознаваниях на 30 кадров это давало дрожь «через кадр».

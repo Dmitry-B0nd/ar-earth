@@ -10,10 +10,10 @@
 //  • Задержка кадра и угол обзора камеры подбираются сами, по ходу (без перезагрузки).
 // Наружу — тот же набор, что у первого движка: renderer, scene, camera, content (ширина листа = 1, Z — вверх от листа).
 import * as THREE from 'three';
-import { createSensors } from './sensors.js?v=5.9';
-import { createFusion } from './fusion.js?v=5.9';
+import { createSensors } from './sensors.js?v=6.0';
+import { createFusion } from './fusion.js?v=6.0';
 
-const VER = '5.9';
+const VER = '6.0';
 const CAL_KEY = 'ar-earth-v2-cal-5.1';   // новая версия подбора обзора — старые (смещённые) значения не берём
 
 export function createEngine2(opts) {
@@ -63,7 +63,7 @@ export function createEngine2(opts) {
   const sensors = createSensors();
   let saved = {};
   try { saved = JSON.parse(localStorage.getItem(CAL_KEY) || '{}') || {}; } catch (e) {}
-  const fusion = createFusion({ sensors, boardM: BOARDM, lag: LAG ?? 50, autoLag: AUTOCAL, autoF: AUTOCAL, lock: DELAY === 0 ? 0 : LOCK, force: FILT || undefined, euroMin: EURO });
+  const fusion = createFusion({ sensors, boardM: BOARDM, lag: LAG ?? 50, autoLag: AUTOCAL, autoF: AUTOCAL, lock: DELAY === 0 ? 0 : LOCK, force: FILT || undefined, euroMin: EURO, lockMode: opts.LOCKMODE || 'frame', fewTags: !!opts.FEWTAGS });
 
   // ---------- Состояние ----------
   let started = false, paused = false, frozen = false, frozenWant = false;
@@ -248,7 +248,7 @@ export function createEngine2(opts) {
       bitmapProbed = true; grabMode = 'pixels';
       console.warn('[движок 2] картинкой метки не находятся — пробую читать пиксели');
     }
-    if (opts.DEV) {      // сырая запись распознаваний
+    if (opts.RAW) {      // сырая запись распознаваний
       RAWD.push({ tf: +m.tFrame.toFixed(1), t: Math.round(now), n: m.n || 0, tags: m.tags || 0, err: m.err ? +m.err.toFixed(3) : 0, ms: +m.ms.toFixed(1),
         H: m.H ? m.H.map((v) => +v.toPrecision(7)) : null, pts: m.pts ? Array.from(m.pts, (v) => +v.toFixed(3)) : null });
       if (RAWD.length > 1500) RAWD.shift();
@@ -321,7 +321,7 @@ export function createEngine2(opts) {
   }
   function onFrame(tf) {
     vf.t = tf; vf.n++; vf.fresh = true; vf.last = performance.now();
-    if (opts.DEV) { RAWF.push([+tf.toFixed(1), Math.round(vf.last)]); if (RAWF.length > 4000) RAWF.shift(); }
+    if (opts.RAW) { RAWF.push([+tf.toFixed(1), Math.round(vf.last)]); if (RAWF.length > 4000) RAWF.shift(); }
     sec.frames++; stats.newFrames++;
     if (!frozen) sendFrame(tf);
   }
@@ -464,7 +464,7 @@ export function createEngine2(opts) {
   // происходило: скорость поворота, смаз, опоздание датчиков, выбранный фильтр, задержки, паузы основного потока.
   // Кнопка «Сохранить запись» отдаёт последние ~30 с файлом — его можно прислать для разбора.
   const REC = [], SLIDE_PX = 12, RAWD = [], RAWF = [];
-  if (opts.DEV) sensors.recordRaw(true);
+  if (opts.RAW) sensors.recordRaw(true);
   let slides = 0, slideMax = 0, lastFrameNow = 0, frameGapMax = 0;
   function record(now, m, r) {
     const F = fusion.st, D = F.diag;
@@ -490,7 +490,7 @@ export function createEngine2(opts) {
     const trk = stream && stream.getVideoTracks()[0], cs = trk && trk.getSettings ? trk.getSettings() : {};
     const data = { build: VER, ua: navigator.userAgent, camSettings: { w: cs.width, h: cs.height, fps: cs.frameRate }, at: new Date().toISOString(), cam: [vw, vh], tsMode: vf.mode, tt: TARGET_TAG,
       grab: grabMode, sensors: { ...sd }, rs: fusion.rs, arm: fusion.arm, rec: REC,
-      f: fusion.f, lag: fusion.lag, raw: { ...sensors.raw, det: RAWD, frames: RAWF } };
+      f: fusion.f, lag: fusion.lag, raw: opts.RAW ? { ...sensors.raw, det: RAWD, frames: RAWF } : null };
     const name = 'ar-zapis-' + new Date().toISOString().slice(11, 19).replace(/:/g, '-') + '.json';
     const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
     try {
