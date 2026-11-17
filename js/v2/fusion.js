@@ -303,6 +303,8 @@ export function createFusion(opts = {}) {
     alphaQ: 0.35,        // скорость поправки поворота листа
     blendMs: 90,
     sceneH: 0.55,
+    visMode: 'auto', eisOn: 0.9, eisOff: 0.95, eisMinDeg: 5, eisMinN: 10, visBlend: 1, visHF: 0,   // режим «по кадру» для камер со стабилизацией: auto / on / off
+    fovMin: 56, fovMax: 76,   // подбор угла обзора не выходит за эти пределы (у основных камер телефонов ~63–74°)
     euroMin: 0, euroBeta: 20,   // сглаживание положения (0 — выкл.; на тестах не помогло: дрожь руки видна и на видео, её надо повторять, а не сглаживать)        // высота центра сцены над листом (ширины листа)
     lock: 0,             // показ с задержкой: насколько ставить кадр по его собственному распознаванию (0…1)         // поправки на экране — плавно за это время
     sigPx: 0.6,          // погрешность угла метки на кадре, пиксели (на резком кадре)
@@ -569,6 +571,7 @@ export function createFusion(opts = {}) {
     const lockW = o.lock * Math.max(0, Math.min(1, (1.8 - sigC) / 1.2)) * (o.fewTags ? Math.min(1, d.n / 16) : 1);
     st.diag.lockW = lockW;
     meas.push({ tf: d.tFrame, tm, z: z.slice(), sl, w: lockW }); if (meas.length > 16) meas.shift();
+    visAdd(d.tFrame, qCM, dec.t, qWC, d.n);
     for (const k in filters) st.diag.nis[k] = filters[k].perr;
     // плавность: разница между старым и новым видом уходит за blendMs
     if (before && st.init && !reset) {
@@ -616,6 +619,80 @@ export function createFusion(opts = {}) {
   let lastPoseNow = null;
   const qCam = new THREE.Quaternion();
   let showOx = 0, showOy = 0;
+  // ---------- Камеры со стабилизацией изображения (многие Android) ----------
+  // Такая камера прячет часть поворота телефона: гироскоп говорит «5°», а в кадре — 4°. Сцена, которую двигает гироскоп,
+  // при этом уезжает с листа. Замечаем это по самим данным: сравниваем поворот камеры по гироскопу и по листу на кадре
+  // (поворот, в отличие от положения, сдвиги руки не искажают). У iPhone доля ≈ 1,0, у Android со стабилизацией 0,75–0,86.
+  // Тогда показываем сцену «по кадру»: между соседними распознаваниями — плавно, а гироскоп — только где распознаваний нет.
+  const vis = [], visQ = new THREE.Quaternion(), visP = new THREE.Vector3();
+  const eisS = { gv: 0, gg: 0, n: 0 };
+  st.eis = false; st.eisK = 1;
+  const _qa = new THREE.Quaternion(), _qb = new THREE.Quaternion(), _qc = new THREE.Quaternion(), _qd = new THREE.Quaternion(), _qe = new THREE.Quaternion(), _va = new THREE.Vector3();
+  const rotVec = (q, out) => {          // кватернион → вектор поворота (рад)
+    const w = Math.max(-1, Math.min(1, q.w)), s = Math.sqrt(Math.max(0, 1 - w * w)), a = 2 * Math.acos(Math.abs(w)) * (w < 0 ? -1 : 1);
+    return s < 1e-9 ? out.set(0, 0, 0) : out.set(q.x / s * a, q.y / s * a, q.z / s * a);
+  };
+  function visAdd(tf, qcm, tcv, qwc, n) {
+    const rec = { tf, q: qcm.clone(), p: new THREE.Vector3(tcv[0], -tcv[1], -tcv[2]), qw: qwc.clone(), n };
+    // доля видимого поворота: по паре (этот кадр и кадр 0,1–0,5 с назад)
+    if (st.gyro && n >= 16) {
+      for (let i = vis.length - 1; i >= 0; i--) {
+        const b = vis[i];
+        if (tf - b.tf < 100) continue;
+        if (tf - b.tf > 500 || b.n < 16) break;
+        const g = rotVec(_qa.copy(b.qw).invert().multiply(qwc), new THREE.Vector3());     // поворот камеры по гироскопу
+        const v = rotVec(_qb.copy(b.q).multiply(_qc.copy(qcm).invert()), new THREE.Vector3());   // по листу
+        const gg = g.lengthSq();
+        if (gg > (0.5 * DEG) ** 2 && gg < (20 * DEG) ** 2) {
+          eisS.gv = eisS.gv * 0.99 + g.dot(v); eisS.gg = eisS.gg * 0.99 + gg; eisS.n++;
+          const k = eisS.gv / eisS.gg, enough = eisS.gg > (o.eisMinDeg * DEG) ** 2 && eisS.n > o.eisMinN;
+          st.eisK = k;
+          if (enough && !st.eis && k < o.eisOn) st.eis = true;
+          else if (enough && st.eis && k > o.eisOff) st.eis = false;
+        }
+        break;
+      }
+    }
+    vis.push(rec); if (vis.length > 40) vis.shift();
+  }
+  // поза «по кадру»: false — нет подходящих распознаваний рядом
+  function visPose(tFrame, t, outQ, outP) {
+    let mb = null, ma = null;
+    for (let i = vis.length - 1; i >= 0; i--) {
+      const m = vis[i];
+      if (m.tf > tFrame + 1) { ma = m; continue; }
+      mb = m; break;
+    }
+    if (mb && tFrame - mb.tf > 600) mb = null;
+    if (ma && ma.tf - tFrame > 250) ma = null;
+    st.diag.visCase = st.diag.visCase || { both: 0, back: 0, none: 0, hf: 0 };
+    if (mb && ma) {
+      st.diag.visCase.both++;
+      const w = (tFrame - mb.tf) / Math.max(1, ma.tf - mb.tf);
+      outQ.copy(mb.q).slerp(ma.q, w); outP.copy(mb.p).lerp(ma.p, w);
+      // между распознаваниями движение не прямолинейно: «изгиб» берём из гироскопа (то, что он показывает сверх
+      // ровного перехода от одного распознанного кадра к другому), с долей visHF
+      if (o.visHF > 0 && S.camAt(t, _qa) && S.camAt(ma.tf - st.lag, _qd)) {
+        st.diag.visCase.hf++;
+        const A = _qb.copy(mb.qw).invert().multiply(_qa);                       // поворот камеры: от mb до сейчас
+        const B = _qc.copy(mb.qw).invert().multiply(_qd);                       // от mb до ma
+        const lin = _qe.identity().slerp(B, w);
+        const res = A.multiply(lin.invert());                                   // «изгиб»
+        _qa.identity().slerp(res, o.visHF).invert();
+        outQ.premultiply(_qa); outP.applyQuaternion(_qa);
+      }
+      return true;
+    }
+    if (!mb) { st.diag.visCase.none++; return false; }
+    st.diag.visCase.back++;
+    // распознаваний впереди нет (рывок, лист пропал): от последнего — по гироскопу (с поправкой на долю видимого поворота)
+    if (!S.camAt(t, _qa)) return false;
+    const dC = _qb.copy(mb.qw).invert().multiply(_qa);                 // поворот камеры с момента распознавания
+    const k = Math.max(0.5, Math.min(1, st.eisK));
+    _qc.identity().slerp(dC, k).invert();
+    outQ.copy(_qc).multiply(mb.q); outP.copy(mb.p).applyQuaternion(_qc);
+    return true;
+  }
   const eu = { t: null, x: new THREE.Vector3(), dx: new THREE.Vector3() };
   const alphaF = (fc, dt) => { const r = 2 * Math.PI * fc * dt; return r / (r + 1); };
   function euro(p, tMs) {
@@ -640,6 +717,12 @@ export function createFusion(opts = {}) {
     offP.multiplyScalar(k);
     qOff.slerp(tq.identity(), 1 - k);
     tickTo(t);
+    let useVis = false;
+    if (o.visMode === 'on' || (o.visMode === 'auto' && st.eis)) {
+      useVis = visPose(tFrame, t, visQ, visP);
+      if (useVis && o.visBlend >= 1) { outQ.copy(visQ); outP.copy(visP); st.visShown = true; lastOutT = t; return true; }
+    }
+    st.visShown = useVis;
     currentP(t, outP);
     if (o.lock > 0 && o.lockMode !== 'interp') {
       // (как в 5.7) есть распознавание ровно этого кадра — притягиваем к нему (доля lock)
@@ -697,6 +780,7 @@ export function createFusion(opts = {}) {
     const qInv = tq2.copy(qCam).invert();
     outQ.copy(qInv).multiply(qOff).multiply(st.qMW);
     outP.applyQuaternion(qInv);
+    if (useVis) { outQ.slerp(visQ, o.visBlend); outP.lerp(visP, o.visBlend); }
     // где на кадре центр сцены (над листом) — для учёта построчной съёмки на следующем кадре
     const e = tv2.set(0, 0, o.sceneH).applyQuaternion(outQ).add(outP);
     if (e.z < -0.05 && st.W) { showOx = Math.max(-0.7, Math.min(0.7, (st.f * e.x / -e.z) / st.W)); showOy = Math.max(-0.7, Math.min(0.7, (-st.f * e.y / -e.z) / st.H)); }
@@ -820,7 +904,7 @@ export function createFusion(opts = {}) {
         const long = Math.max(st.W, st.H);
         const nf = st.f * (1 + Math.max(-0.04, Math.min(0.04, (best - 1) * 0.6)));
         const fov = 2 * Math.atan(long / 2 / nf) / DEG;
-        if (fov > 50 && fov < 82) { st.f = nf; C.fRuns++; }
+        if (fov > o.fovMin && fov < o.fovMax) { st.f = nf; C.fRuns++; }
       }
       C.fDir = dir;
     } else if (C.turn === 1 && o.autoF && ex.view > 12) {
@@ -836,7 +920,7 @@ export function createFusion(opts = {}) {
         const long = Math.max(st.W, st.H);
         const nf = st.f * (1 + Math.max(-0.03, Math.min(0.03, (best - 1) * 0.5)));
         const fov = 2 * Math.atan(long / 2 / nf) / DEG;
-        if (fov > 50 && fov < 82) { st.f = nf; C.fRuns++; }
+        if (fov > o.fovMin && fov < o.fovMax) { st.f = nf; C.fRuns++; }
       }
       C.fDir = dir;
     }

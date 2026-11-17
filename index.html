@@ -218,14 +218,14 @@
 import * as THREE from 'three';
 import Stats from 'three/addons/libs/stats.module.js';
 // ?v=… в адресах — чтобы браузер не взял старую версию файла из кэша
-import { createTracker } from './js/tracking.js?v=6.0';
-import { createEngine2 } from './js/v2/engine.js?v=6.0';
-import { createEarth, loadEarthTextures } from './js/earth.js?v=6.0';
-import { createImu } from './js/imu.js?v=6.0';
-import { createViewer3D } from './js/viewer3d.js?v=6.0';
-import { createSatellites, loadSatellites } from './js/satellites.js?v=6.0';
-import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=6.0';
-const BUILD = '6.0';
+import { createTracker } from './js/tracking.js?v=6.2';
+import { createEngine2 } from './js/v2/engine.js?v=6.2';
+import { createEarth, loadEarthTextures } from './js/earth.js?v=6.2';
+import { createImu } from './js/imu.js?v=6.2';
+import { createViewer3D } from './js/viewer3d.js?v=6.2';
+import { createSatellites, loadSatellites } from './js/satellites.js?v=6.2';
+import { createPoi, loadPoi, POI_VERSION } from './js/poi.js?v=6.2';
+const BUILD = '6.2';
 console.log('[сборка]', BUILD, '| poi.js:', POI_VERSION);
 if (POI_VERSION !== BUILD) console.error('Файлы разных версий! index.html =', BUILD, ', js/poi.js =', POI_VERSION);
 
@@ -300,7 +300,7 @@ const E2 = {
   FILT: ['acc+', 'acc-', 'cv', 'hold', 'arm'].includes(q.get('filt')) ? q.get('filt') : '', DEV: !!window.DEV, ROIFIX: q.get('roifix') === '0' ? 0 : 1,
   // cam=720 — просить у камеры 1280×720 (у некоторых телефонов 60 к/с бывают только так: меньше смаз на рывках); euro — сглаживание, Гц
   // raw=1 — подробная запись (все показания датчиков) для прогона по записи; lockmode=interp, fewtags=1 — опыты 5.8–5.9
-  RAW: q.get('raw') === '1', LOCKMODE: q.get('lockmode') || 'frame', FEWTAGS: q.get('fewtags') === '1',
+  RESETCAL: q.get('resetcal') === '1', VISMODE: ['on', 'off', 'auto'].includes(q.get('vis')) ? q.get('vis') : 'auto', RAW: q.get('raw') === '1', LOCKMODE: q.get('lockmode') || 'frame', FEWTAGS: q.get('fewtags') === '1',
   CAMW: q.get('cam') === '720' ? 1280 : 640, CAMH: q.get('cam') === '720' ? 720 : 480, EURO: num('euro', 0),
 };
 if (ENGINE === 2) document.getElementById('hint').querySelector('img').src = 'img/marker-hint-v2.png';

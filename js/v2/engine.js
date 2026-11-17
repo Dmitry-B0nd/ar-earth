@@ -10,10 +10,10 @@
 //  • Задержка кадра и угол обзора камеры подбираются сами, по ходу (без перезагрузки).
 // Наружу — тот же набор, что у первого движка: renderer, scene, camera, content (ширина листа = 1, Z — вверх от листа).
 import * as THREE from 'three';
-import { createSensors } from './sensors.js?v=6.0';
-import { createFusion } from './fusion.js?v=6.0';
+import { createSensors } from './sensors.js?v=6.2';
+import { createFusion } from './fusion.js?v=6.2';
 
-const VER = '6.0';
+const VER = '6.2';
 const CAL_KEY = 'ar-earth-v2-cal-5.1';   // новая версия подбора обзора — старые (смещённые) значения не берём
 
 export function createEngine2(opts) {
@@ -62,8 +62,10 @@ export function createEngine2(opts) {
   // ---------- Датчики и слияние ----------
   const sensors = createSensors();
   let saved = {};
+  // ?resetcal=1 — забыть подобранные задержку и угол обзора (если подбор однажды ушёл не туда)
+  if (opts.RESETCAL) try { localStorage.removeItem(CAL_KEY); } catch (e) {}
   try { saved = JSON.parse(localStorage.getItem(CAL_KEY) || '{}') || {}; } catch (e) {}
-  const fusion = createFusion({ sensors, boardM: BOARDM, lag: LAG ?? 50, autoLag: AUTOCAL, autoF: AUTOCAL, lock: DELAY === 0 ? 0 : LOCK, force: FILT || undefined, euroMin: EURO, lockMode: opts.LOCKMODE || 'frame', fewTags: !!opts.FEWTAGS });
+  const fusion = createFusion({ sensors, boardM: BOARDM, lag: LAG ?? 50, autoLag: AUTOCAL, autoF: AUTOCAL, lock: DELAY === 0 ? 0 : LOCK, force: FILT || undefined, euroMin: EURO, lockMode: opts.LOCKMODE || 'frame', fewTags: !!opts.FEWTAGS, visMode: opts.VISMODE || 'auto' });
 
   // ---------- Состояние ----------
   let started = false, paused = false, frozen = false, frozenWant = false;
@@ -216,7 +218,7 @@ export function createEngine2(opts) {
 
   // задержка показа: сколько обычно проходит от прихода кадра до готового распознавания (+ запас)
   const sentTa = new Map();
-  let visLat = 40, delayMs = DELAY > 0 ? DELAY : 0;
+  let visLat = 40, delayMs = DELAY > 0 ? DELAY : 0, measInt = 50, lastFoundT = 0;
   function onResult(m) {
     busy = false;
     const ta = sentTa.get(m.id); sentTa.delete(m.id);
@@ -225,7 +227,10 @@ export function createEngine2(opts) {
       visLat += (L - visLat) * (L > visLat ? 0.3 : 0.05);         // вверх быстро, вниз медленно
       // задержку показа меняем редко и ступеньками: если она «гуляет» от кадра к кадру, кадры идут неровно
       if (DELAY < 0) {
-        const target = Math.min(MAXDELAY, visLat + 8);
+        // Камера со стабилизацией (многие Android): сцена ставится «по кадру» — между соседними распознаваниями.
+        // Для этого к моменту показа кадра должно быть готово и СЛЕДУЮЩЕЕ распознавание: задержка больше на промежуток
+        // между распознаваниями (по прогону записи с Android: ошибка 5,6 → 2,1 px при задержке ~110 мс).
+        const target = Math.min(MAXDELAY, visLat + 8 + (fusion.st.eis ? 1.3 * measInt : 0));
         if (target > delayMs + 4 || target < delayMs - 12) delayMs += (target - delayMs) * 0.5;
       }
     }
@@ -262,7 +267,11 @@ export function createEngine2(opts) {
     if (lost && fusion.st.init) fusion.reacquire();
     flushMotion();
     const r = fusion.measure({ tFrame: m.tFrame, pts: m.pts, n: m.n, H: m.H, err: m.n >= 8 ? m.err : null });
-    if (r.ok) { stats.updates++; sec.found++; } else stats.rejected++;
+    if (r.ok) {
+      stats.updates++; sec.found++;
+      if (lastFoundT) measInt += (Math.min(250, now - lastFoundT) - measInt) * 0.1;
+      lastFoundT = now;
+    } else stats.rejected++;
     record(now, m, r);
     if (AUTOCAL) fusion.calibStep(now);
     saveCal(now);
@@ -273,9 +282,9 @@ export function createEngine2(opts) {
   function saveCal(now) {
     if (now - lastSave < 5000) return;
     const c = fusion.st.calib;
-    if (c.lagRuns + c.fRuns === 0) return;
+    if (c.lagRuns + c.fRuns === 0 && !fusion.st.eis) return;
     lastSave = now;
-    try { localStorage.setItem(CAL_KEY, JSON.stringify({ lag: Math.round(fusion.lag), fov: +fusion.fov.toFixed(1), mode: vf.mode, at: new Date().toISOString() })); } catch (e) {}
+    try { localStorage.setItem(CAL_KEY, JSON.stringify({ lag: Math.round(fusion.lag), fov: +fusion.fov.toFixed(1), mode: vf.mode, eis: fusion.st.eis, at: new Date().toISOString() })); } catch (e) {}
   }
 
   // ---------- Кадры камеры ----------
@@ -354,6 +363,7 @@ export function createEngine2(opts) {
       const fov = Number.isFinite(saved.fov) && opts.FOV == null ? saved.fov : FOV;
       f0 = (Math.max(w, h) / 2) / Math.tan(fov * Math.PI / 360);
       fusion.setCamera(w, h, f0);
+      if (saved.eis && opts.VISMODE !== 'off') fusion.st.eis = true;
     } else {
       fusion.setCamera(w, h);            // кадр повернулся: фокус в пикселях тот же, позу ищем заново
       fusion.reset();
@@ -526,7 +536,8 @@ export function createEngine2(opts) {
     const tags = sec.tags ? `меток ${sec.tags} (сторона ${sec.side.toFixed(0)} px)` : 'меток 0';
     const slideTxt = `сносы (>${SLIDE_PX} px): ${slides}, макс ${slideMax.toFixed(0)} px` + (REC.length ? `, последний ${REC[REC.length - 1].snos ?? '—'} px` : '');
     return `${slideTxt}\n` + `движок 2  камера ${vw}×${vh} ${fr ? Math.round(fr) + ' к/с' : ''}, новых ${per(d.frames)}/с (время ${vf.mode})\n` +
-      `показ с задержкой ${delayMs.toFixed(0)} мс${DELAY < 0 ? ' (авто)' : ''}\n` +
+      `показ с задержкой ${delayMs.toFixed(0)} мс${DELAY < 0 ? ' (авто)' : ''}  ` +
+      `стабилизация камеры: ${fusion.st.eis ? 'ДА' : 'нет'} (видно ${Math.round(fusion.st.eisK * 100)}% поворота)${fusion.st.visShown ? ' → сцена по кадру' : ''}\n` +
       `поиск ${per(d.res)}/с: ${d.res ? (d.procMs / d.res).toFixed(1) : '—'} мс ${worker && workerOk ? 'в фоне' : 'в основном потоке'}` +
       ` + захват ${d.sent ? (d.grabMs / d.sent).toFixed(1) : '—'} мс (${grabMode === 'bitmap' ? 'картинкой' : 'пикселями'})\n` +
       `  ${sec.roi} (чёткость ${TARGET_TAG})  ${tags}  нашёл ${per(d.found)}/с  смаз: пропуск ${d.blurSkip} отказ ${F.diag.blurRej}  передышка ${d.dutySkip}${d.fails ? '  сбоев ' + d.fails : ''}\n` +
