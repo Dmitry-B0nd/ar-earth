@@ -10,15 +10,15 @@
 //  • Задержка кадра и угол обзора камеры подбираются сами, по ходу (без перезагрузки).
 // Наружу — тот же набор, что у первого движка: renderer, scene, camera, content (ширина листа = 1, Z — вверх от листа).
 import * as THREE from 'three';
-import { createSensors } from './sensors.js?v=5.5';
-import { createFusion } from './fusion.js?v=5.5';
+import { createSensors } from './sensors.js?v=5.6';
+import { createFusion } from './fusion.js?v=5.6';
 
-const VER = '5.5';
+const VER = '5.6';
 const CAL_KEY = 'ar-earth-v2-cal-5.1';   // новая версия подбора обзора — старые (смещённые) значения не берём
 
 export function createEngine2(opts) {
   const { container, onFound, onLost, onStall, FOV = 66, CAMFPS = 60, MAXPIX = 76800, BOARDM = 0.18, BG = 'gl',
-    SKIPBLUR = 30, KEEP = 8000, TT0 = 0, BUDGET = 0, DELAY = -1, MAXDELAY = 140, LOCK = 0.7, DUTY = 1, FILT = '', LAG = null, SMOOTHCLK = false, GRAB = 'auto', AA = true, AUTOCAL = true, NATIVELAG = 60 } = opts;
+    SKIPBLUR = 30, KEEP = 8000, TT0 = 0, BUDGET = 0, DELAY = -1, MAXDELAY = 140, LOCK = 0.7, DUTY = 1, FILT = '', ROIFIX = 1, LAG = null, SMOOTHCLK = false, GRAB = 'auto', AA = true, AUTOCAL = true, NATIVELAG = 60 } = opts;
 
   // ---------- Рисование ----------
   const renderer = new THREE.WebGLRenderer({ antialias: AA, alpha: BG === 'native', powerPreference: 'default' });
@@ -86,7 +86,7 @@ export function createEngine2(opts) {
   let grabMode = GRAB === 'auto' ? (typeof OffscreenCanvas !== 'undefined' && typeof createImageBitmap === 'function' ? 'bitmap' : 'pixels') : GRAB;
   let bitmapFails = 0, bitmapProbed = false, lastTagsT = 0;
   const bitmapSince = performance.now();
-  let searchFlip = 0, lastGrabMs = 0, nextSendT = 0;
+  let searchFlip = 0, lastGrabMs = 0, nextSendT = 0, roiFails = 0, roiUsed = false;
 
   function startVision() {
     try {
@@ -132,14 +132,22 @@ export function createEngine2(opts) {
   }
   function planRoi(tf) {
     let sx = 0, sy = 0, sw = vw, sh = vh, scale;
-    const tracking = fusion.st.init && performance.now() - fusion.st.lastMeas < 600;
+    // Ищем вокруг предсказанного места. Но если там уже не нашлось (лист быстро сдвинули, прогноз отстал) —
+    // в следующий раз смотрим шире, а после второй неудачи — по всему кадру (раньше ждали 0,6 с — это и были «сносы»
+    // на слабом телефоне: распознавание раз за разом смотрело мимо листа).
+    const tracking = fusion.st.init && performance.now() - fusion.st.lastMeas < 600 && (!ROIFIX || roiFails < 2);
     const pc = tracking ? fusion.predictCorners(tf) : null;
+    roiUsed = !!pc;
     if (pc) {
       let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
       for (const [x, y] of pc) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
       const side = (Math.hypot(pc[1][0] - pc[0][0], pc[1][1] - pc[0][1]) + Math.hypot(pc[2][0] - pc[1][0], pc[2][1] - pc[1][1]) +
         Math.hypot(pc[3][0] - pc[2][0], pc[3][1] - pc[2][1]) + Math.hypot(pc[0][0] - pc[3][0], pc[0][1] - pc[3][1])) / 4;
-      const m = Math.max(x1 - x0, y1 - y0) * 0.25 + 24;
+      // запас: четверть размера листа + насколько лист сдвинулся по прогнозу за последние ~120 мс (быстрее движется — шире)
+      const pp = fusion.predictCorners(tf - 120);
+      let mv = 0;
+      if (pp) for (let i = 0; i < 4; i++) mv = Math.max(mv, Math.hypot(pc[i][0] - pp[i][0], pc[i][1] - pp[i][1]));
+      const m = ROIFIX ? (Math.max(x1 - x0, y1 - y0) * 0.25 + 24 + mv) * (1 + roiFails) : Math.max(x1 - x0, y1 - y0) * 0.25 + 24;
       sx = Math.max(0, Math.floor(x0 - m)); sy = Math.max(0, Math.floor(y0 - m));
       sw = Math.min(vw, Math.ceil(x1 + m)) - sx; sh = Math.min(vh, Math.ceil(y1 + m)) - sy;
       if (sw < 48 || sh < 48) { sx = 0; sy = 0; sw = vw; sh = vh; }
@@ -240,6 +248,8 @@ export function createEngine2(opts) {
       bitmapProbed = true; grabMode = 'pixels';
       console.warn('[движок 2] картинкой метки не находятся — пробую читать пиксели');
     }
+    if (m.tags > 0 && m.n >= 4) roiFails = 0; else if (roiUsed) roiFails++;
+    if (!(m.n >= 4)) recordFail(now, m);
     if (frozen || paused || !m.n || m.n < 4) return;
     // первое нахождение (и после долгой потери) — минимум по двум меткам: одну метку легче спутать с узором
     const lost = !fusion.st.init || now - fusion.st.lastMeas > 1500;
@@ -463,6 +473,11 @@ export function createEngine2(opts) {
     REC.push(e); if (REC.length > 900) REC.shift();
     if (e.snos != null && e.snos > SLIDE_PX) { slides++; slideMax = Math.max(slideMax, e.snos); }
   }
+  function recordFail(now, m) {
+    REC.push({ t: Math.round(now), tf: Math.round(m.tFrame), ok: 0, why: 'не найден', tags: m.tags || 0, ms: +(m.ms || 0).toFixed(1),
+      rate: Math.round(sensors.rateAt(m.tFrame - fusion.lag) * 57.3), roi: roiUsed ? 1 : 0, roiFails, filt: fusion.st.filt });
+    if (REC.length > 900) REC.shift();
+  }
   async function saveRecord() {
     const sd = sensors.diag;
     const data = { build: VER, ua: navigator.userAgent, at: new Date().toISOString(), cam: [vw, vh], tsMode: vf.mode, tt: TARGET_TAG,
@@ -536,6 +551,7 @@ export function createEngine2(opts) {
     get frames() { return vf.n; },
     get shownFrame() { return shownSlot ? shownSlot.n : -1; },
     get delayMs() { return delayMs; },
+    get rec() { return REC; },
     get shown() { return content.visible; },
     get frozen() { return frozen; },
     get restarting() { return false; },
