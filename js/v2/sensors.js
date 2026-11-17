@@ -18,6 +18,8 @@ export function createSensors() {
   const motionQ = [];          // новые показания ускорения, ещё не отданные фильтру
   const diag = { rel: 0, relNull: 0, abs: 0, absNull: 0, mot: 0, acc: 0, late: 0, rateO: 0, rateM: 0 };
   let relT = -1e9, source = '—', listening = false, lastMotionT = -1e9;
+  // «сырая» запись (режим разработчика): все показания с метками времени — чтобы прогонять программу по записи
+  let rawOn = false; const rawO = [], rawM = [];
 
   const stamp = (e) => {
     const now = performance.now(), ts = e && e.timeStamp;
@@ -36,6 +38,7 @@ export function createSensors() {
     q.setFromEuler(euler);
     // без скачков знака (q и −q — один поворот): для интерполяции
     if (on && q.x * oq[oi * 4] + q.y * oq[oi * 4 + 1] + q.z * oq[oi * 4 + 2] + q.w * oq[oi * 4 + 3] < 0) { q.x = -q.x; q.y = -q.y; q.z = -q.z; q.w = -q.w; }
+    if (rawOn) { rawO.push([Math.round(t * 10) / 10, +(e.alpha || 0).toFixed(3), +e.beta.toFixed(3), +e.gamma.toFixed(3)]); if (rawO.length > 4000) rawO.shift(); }
     oi = (oi + 1) % N; on = Math.min(N, on + 1);
     ot[oi] = t; oq[oi * 4] = q.x; oq[oi * 4 + 1] = q.y; oq[oi * 4 + 2] = q.z; oq[oi * 4 + 3] = q.w;
   }
@@ -47,6 +50,7 @@ export function createSensors() {
     const acc = a && a.x != null ? [a.x, a.y, a.z] : null;
     if (acc) diag.acc++;
     motionQ.push({ t, acc, accG: g && g.x != null ? [g.x, g.y, g.z] : null });
+    if (rawOn) { const r3 = (v) => v ? v.map((x) => +x.toFixed(4)) : null; rawM.push([Math.round(t * 10) / 10, r3(acc), r3(g && g.x != null ? [g.x, g.y, g.z] : null)]); if (rawM.length > 4000) rawM.shift(); }
     if (motionQ.length > 400) motionQ.splice(0, motionQ.length - 400);
     lastMotionT = t;
   }
@@ -107,6 +111,8 @@ export function createSensors() {
       window.removeEventListener('devicemotion', onMotion);
     },
     devAt,
+    recordRaw(on) { rawOn = on; },
+    get raw() { return { o: rawO, m: rawM, screen: screenAngle() }; },
     // ориентация камеры в комнате (оси камеры three.js с учётом поворота экрана)
     camAt(t, out) {
       if (!devAt(t, out)) return false;

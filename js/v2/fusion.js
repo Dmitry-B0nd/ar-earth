@@ -652,7 +652,15 @@ export function createFusion(opts = {}) {
         if (tFrame - m.tf < 250) mb = m;
         break;
       }
-      const corr = (m, out) => { currentP(m.tm, tv); return out.set(m.w * (m.z[0] - tv.x), m.w * (m.z[1] - tv.y), m.w * (m.z[2] - tv.z)); };
+      // только поперёк взгляда: по глубине распознавание неточно, и привязка по ней давала «сердцебиение» (Земля то
+      // уменьшалась, то увеличивалась). Положение на экране — поперёк взгляда, его и притягиваем.
+      const corr = (m, out) => {
+        currentP(m.tm, tv);
+        out.set(m.w * (m.z[0] - tv.x), m.w * (m.z[1] - tv.y), m.w * (m.z[2] - tv.z));
+        const L = Math.hypot(m.z[0], m.z[1], m.z[2]) || 1, ux = m.z[0] / L, uy = m.z[1] / L, uz = m.z[2] / L;
+        const d = out.x * ux + out.y * uy + out.z * uz;
+        return out.set(out.x - d * ux, out.y - d * uy, out.z - d * uz);
+      };
       if (mb && Math.abs(mb.tf - tFrame) < 2 && mb.tf !== lastLockTf) {     // мерило дрожи: прогноз против распознавания
         lastLockTf = mb.tf;
         st.diag.corr += Math.hypot(mb.z[0] - outP.x, mb.z[1] - outP.y, mb.z[2] - outP.z) / Math.max(0.3, outP.length()) * st.f; st.diag.corrN++;
